@@ -2,10 +2,6 @@ import type { AppConfig } from './config.js';
 import type { RouteRecord } from './domain.js';
 import { RouteManagerError } from './errors.js';
 
-export interface TraefikOptions {
-  rejectNonActive?: boolean;
-}
-
 export interface TraefikDocument {
   http: {
     routers: Record<string, {
@@ -25,7 +21,6 @@ export interface TraefikDocument {
 export function buildTraefikDocument(
   routes: RouteRecord[],
   config: AppConfig,
-  options?: TraefikOptions,
 ): TraefikDocument {
   const routers: TraefikDocument['http']['routers'] = {};
   const services: TraefikDocument['http']['services'] = {};
@@ -34,13 +29,10 @@ export function buildTraefikDocument(
 
   for (const route of sorted) {
     if (route.status !== 'active') {
-      if (options?.rejectNonActive) {
-        throw new RouteManagerError(
-          'INVALID_SLUG',
-          `route "${route.slug}" is not active (status: ${route.status})`,
-        );
-      }
-      continue;
+      throw new RouteManagerError(
+        'INVALID_SLUG',
+        `route "${route.slug}" is not active (status: ${route.status})`,
+      );
     }
 
     const key = `agent-${route.slug}`;

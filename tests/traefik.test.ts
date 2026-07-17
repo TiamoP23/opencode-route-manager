@@ -65,23 +65,32 @@ describe('buildTraefikDocument', () => {
     expect(routerKeys).toEqual(['agent-alpha', 'agent-zeta']);
   });
 
-  it('ignores creating routes', () => {
+  it('rejects creating route unconditionally', () => {
     const creating = { ...activeRoute('demo', 5173), status: 'creating' as const };
-    expect(buildTraefikDocument([creating], config)).toEqual({
-      http: { routers: {}, services: {} },
-    });
+    expect(() => buildTraefikDocument([creating], config)).toThrow(RouteManagerError);
   });
 
-  it('ignores deleting routes', () => {
+  it('rejects deleting route unconditionally', () => {
     const deleting = { ...activeRoute('demo', 5173), status: 'deleting' as const };
-    expect(buildTraefikDocument([deleting], config)).toEqual({
-      http: { routers: {}, services: {} },
-    });
+    expect(() => buildTraefikDocument([deleting], config)).toThrow(RouteManagerError);
   });
 
-  it('rejects non-active route with RouteManagerError', () => {
+  it('rejects non-active route with INVALID_SLUG code', () => {
     const creating = { ...activeRoute('demo', 5173), status: 'creating' as const };
-    expect(() => buildTraefikDocument([creating], config, { rejectNonActive: true })).toThrow(RouteManagerError);
+    try {
+      buildTraefikDocument([creating], config);
+      expect.unreachable('should have thrown');
+    } catch (e: unknown) {
+      expect((e as RouteManagerError).code).toBe('INVALID_SLUG');
+    }
+  });
+
+  it('rejects mixed routes containing a non-active route', () => {
+    const routes: RouteRecord[] = [
+      activeRoute('alpha', 3000),
+      { ...activeRoute('broken', 3001), status: 'creating' as const },
+    ];
+    expect(() => buildTraefikDocument(routes, config)).toThrow(RouteManagerError);
   });
 
   it('returns empty projection for empty routes', () => {
