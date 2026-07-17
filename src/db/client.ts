@@ -11,14 +11,19 @@ export interface DatabaseContext {
 
 export function openDatabase(path: string, migrationsFolder: string): DatabaseContext {
   const sqlite = new DatabaseSync(path);
-  sqlite.exec('PRAGMA journal_mode = WAL');
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  sqlite.exec('PRAGMA busy_timeout = 5000');
-  const db = drizzle({ client: sqlite });
-  migrate(db, { migrationsFolder });
-  return {
-    sqlite,
-    db,
-    close: () => { sqlite.close(); },
-  };
+  try {
+    sqlite.exec('PRAGMA journal_mode = WAL');
+    sqlite.exec('PRAGMA foreign_keys = ON');
+    sqlite.exec('PRAGMA busy_timeout = 5000');
+    const db = drizzle({ client: sqlite });
+    migrate(db, { migrationsFolder });
+    return {
+      sqlite,
+      db,
+      close: () => { sqlite.close(); },
+    };
+  } catch (e) {
+    sqlite.close();
+    throw e;
+  }
 }

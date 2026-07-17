@@ -48,54 +48,59 @@ export class SqliteRouteStore implements RouteStore {
   }
 
   async count(): Promise<number> {
-    const [row] = await this.db.select({ value: count() }).from(routes);
+    const [row] = this.db.select({ value: count() }).from(routes).all();
     return row!.value;
   }
 
   async get(slug: string): Promise<RouteRecord | null> {
-    const [row] = await this.db.select().from(routes).where(eq(routes.slug, slug)).limit(1);
+    const row = this.db.select().from(routes).where(eq(routes.slug, slug)).limit(1).get() as RouteSelect | undefined;
     return row ? rowToRecord(row) : null;
   }
 
   async list(): Promise<RouteRecord[]> {
-    const rows = await this.db.select().from(routes).orderBy(routes.slug);
+    const rows = this.db.select().from(routes).orderBy(routes.slug).all() as RouteSelect[];
     return rows.map(rowToRecord);
   }
 
   async listActive(): Promise<RouteRecord[]> {
-    const rows = await this.db
+    const rows = this.db
       .select()
       .from(routes)
       .where(eq(routes.status, 'active'))
-      .orderBy(routes.slug);
+      .orderBy(routes.slug)
+      .all() as RouteSelect[];
     return rows.map(rowToRecord);
   }
 
   async listPending(): Promise<RouteRecord[]> {
-    const rows = await this.db
+    const rows = this.db
       .select()
       .from(routes)
-      .where(eq(routes.status, 'deleting'))
-      .orderBy(routes.slug);
+      .where(sql`${routes.status} IN ('creating', 'deleting')`)
+      .orderBy(routes.slug)
+      .all() as RouteSelect[];
     return rows.map(rowToRecord);
   }
 
   async insertCreating(input: { slug: string; port: number; description: string | null }): Promise<RouteRecord> {
     const now = new Date();
     try {
-      const [row] = await this.db
-        .insert(routes)
-        .values({
-          slug: input.slug,
-          port: input.port,
-          description: input.description,
-          status: 'creating',
-          retryCount: 0,
-          createdAt: now,
-          updatedAt: now,
-        } satisfies RouteInsert)
-        .returning();
-      return rowToRecord(row!);
+      return this.db.transaction((tx) => {
+        const [row] = tx
+          .insert(routes)
+          .values({
+            slug: input.slug,
+            port: input.port,
+            description: input.description,
+            status: 'creating' satisfies RouteStatus,
+            retryCount: 0,
+            createdAt: now,
+            updatedAt: now,
+          } satisfies RouteInsert)
+          .returning()
+          .all() as RouteSelect[];
+        return rowToRecord(row!);
+      });
     } catch (e: unknown) {
       const cause = (e as any).cause;
       if (cause?.code === 'ERR_SQLITE_ERROR' && cause?.message?.includes('UNIQUE')) {
@@ -107,20 +112,23 @@ export class SqliteRouteStore implements RouteStore {
 
   async activate(slug: string, recordId: string | null): Promise<RouteRecord> {
     const now = new Date();
-    const [row] = await this.db
-      .update(routes)
-      .set({
-        status: 'active',
-        cloudflareRecordId: recordId,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-        retryCount: 0,
-        updatedAt: now,
-      })
-      .where(eq(routes.slug, slug))
-      .returning();
-    if (!row) throw ROUTE_NOT_FOUND;
-    return rowToRecord(row);
+    return this.db.transaction((tx) => {
+      const row = tx
+        .update(routes)
+        .set({
+          status: 'active',
+          cloudflareRecordId: recordId,
+          lastErrorCode: null,
+          lastErrorMessage: null,
+          retryCount: 0,
+          updatedAt: now,
+        })
+        .where(eq(routes.slug, slug))
+        .returning()
+        .get() as RouteSelect | undefined;
+      if (!row) throw ROUTE_NOT_FOUND;
+      return rowToRecord(row);
+    });
   }
 
   async updateActive(slug: string, patch: { port?: number; description?: string | null }): Promise<RouteRecord> {
@@ -134,59 +142,73 @@ export class SqliteRouteStore implements RouteStore {
     if (patch.port !== undefined) values.port = patch.port;
     if (patch.description !== undefined) values.description = patch.description;
 
-    const [row] = await this.db
-      .update(routes)
-      .set(values)
-      .where(and(eq(routes.slug, slug), eq(routes.status, 'active')))
-      .returning();
-    if (!row) throw ROUTE_NOT_FOUND;
-    return rowToRecord(row);
+    return this.db.transaction((tx) => {
+      const row = tx
+        .update(routes)
+        .set(values)
+        .where(and(eq(routes.slug, slug), eq(routes.status, 'active')))
+        .returning()
+        .get() as RouteSelect | undefined;
+      if (!row) throw ROUTE_NOT_FOUND;
+      return rowToRecord(row);
+    });
   }
 
   async markDeleting(slug: string): Promise<RouteRecord> {
     const now = new Date();
-    const [row] = await this.db
-      .update(routes)
-      .set({ status: 'deleting', updatedAt: now })
-      .where(eq(routes.slug, slug))
-      .returning();
-    if (!row) throw ROUTE_NOT_FOUND;
-    return rowToRecord(row);
+    return this.db.transaction((tx) => {
+      const row = tx
+        .update(routes)
+        .set({ status: 'deleting', updatedAt: now })
+        .where(eq(routes.slug, slug))
+        .returning()
+        .get() as RouteSelect | undefined;
+      if (!row) throw ROUTE_NOT_FOUND;
+      return rowToRecord(row);
+    });
   }
 
   async setCloudflareRecordId(slug: string, recordId: string): Promise<RouteRecord> {
     const now = new Date();
-    const [row] = await this.db
-      .update(routes)
-      .set({ cloudflareRecordId: recordId, updatedAt: now })
-      .where(eq(routes.slug, slug))
-      .returning();
-    if (!row) throw ROUTE_NOT_FOUND;
-    return rowToRecord(row);
+    return this.db.transaction((tx) => {
+      const row = tx
+        .update(routes)
+        .set({ cloudflareRecordId: recordId, updatedAt: now })
+        .where(eq(routes.slug, slug))
+        .returning()
+        .get() as RouteSelect | undefined;
+      if (!row) throw ROUTE_NOT_FOUND;
+      return rowToRecord(row);
+    });
   }
 
   async recordError(slug: string, error: { code: string; message: string }): Promise<void> {
     const now = new Date();
-    const result = await this.db
-      .update(routes)
-      .set({
-        lastErrorCode: error.code,
-        lastErrorMessage: error.message,
-        retryCount: sql`retry_count + 1`,
-        updatedAt: now,
-      })
-      .where(eq(routes.slug, slug))
-      .returning();
-    if (result.length === 0) throw ROUTE_NOT_FOUND;
+    this.db.transaction((tx) => {
+      const result = tx
+        .update(routes)
+        .set({
+          lastErrorCode: error.code,
+          lastErrorMessage: error.message,
+          retryCount: sql`retry_count + 1`,
+          updatedAt: now,
+        })
+        .where(eq(routes.slug, slug))
+        .returning()
+        .all() as RouteSelect[];
+      if (result.length === 0) throw ROUTE_NOT_FOUND;
+    });
   }
 
   async remove(slug: string): Promise<void> {
-    await this.db.delete(routes).where(eq(routes.slug, slug));
+    this.db.transaction((tx) => {
+      tx.delete(routes).where(eq(routes.slug, slug)).run();
+    });
   }
 
   async ping(): Promise<boolean> {
     try {
-      const result = await this.db.get(sql`SELECT 1`);
+      const result = this.db.get(sql`SELECT 1`);
       return result !== undefined && result !== null;
     } catch {
       return false;

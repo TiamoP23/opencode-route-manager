@@ -1,7 +1,8 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/db/client.js';
 import { SqliteRouteStore } from '../src/db/route-store.js';
 import type { RouteStore } from '../src/db/route-store.js';
@@ -167,6 +168,52 @@ describe('SqliteRouteStore', () => {
       expect(rows).toEqual([]);
     } finally {
       ctx.close();
+    }
+  });
+
+  it('listPending returns both creating and deleting routes', async () => {
+    // The current test only creates a deleting route.
+    // This test verifies creating routes are also included.
+    await store.insertCreating({ slug: 'pending-create', port: 3000, description: null });
+    await store.insertCreating({ slug: 'will-be-active', port: 3001, description: null });
+    await store.activate('will-be-active', null);
+    await store.markDeleting('will-be-active');
+    // Now we have: one 'creating', one 'deleting'
+    const pending = await store.listPending();
+    const slugs = pending.map(r => r.slug).sort();
+    expect(slugs).toContain('pending-create');
+    expect(slugs).toContain('will-be-active');
+  });
+
+  it('insertCreating preserves original on duplicate within transaction boundary', async () => {
+    const route1 = await store.insertCreating({ slug: 'tx-demo', port: 3000, description: 'first' });
+    expect(route1.port).toBe(3000);
+    await expect(
+      store.insertCreating({ slug: 'tx-demo', port: 8080, description: 'second' })
+    ).rejects.toThrow();
+    // Original must be untouched
+    const check = await store.get('tx-demo');
+    expect(check?.port).toBe(3000);
+    expect(check?.description).toBe('first');
+  });
+
+  it('openDatabase closes handle on migration failure', async () => {
+    const closeSpy = vi.spyOn(DatabaseSync.prototype, 'close');
+    const badFolder = join(tempDir, 'nonexistent-drizzle');
+    const failPath = join(tempDir, 'fail-migrate.sqlite');
+    try {
+      await expect(async () => {
+        openDatabase(failPath, badFolder);
+      }).rejects.toThrow();
+      // DatabaseSync.close must have been called during the failure cleanup
+      expect(closeSpy).toHaveBeenCalled();
+      // Also verify the file is accessible (handle released)
+      expect(existsSync(failPath)).toBe(true);
+      const check = new DatabaseSync(failPath);
+      check.exec('SELECT 1');
+      check.close();
+    } finally {
+      closeSpy.mockRestore();
     }
   });
 });
