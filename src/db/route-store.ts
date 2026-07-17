@@ -1,32 +1,24 @@
+import { eq, and, count, sql } from 'drizzle-orm';
 import type { RouteRecord, RouteStatus } from '../domain.js';
 import { RouteManagerError } from '../errors.js';
 import type { DatabaseContext } from './client.js';
+import { routes } from './schema.js';
 
-interface RouteRow {
-  slug: string;
-  port: number;
-  description: string | null;
-  status: string;
-  cloudflare_record_id: string | null;
-  last_error_code: string | null;
-  last_error_message: string | null;
-  retry_count: number;
-  created_at: number;
-  updated_at: number;
-}
+type RouteInsert = typeof routes.$inferInsert;
+type RouteSelect = typeof routes.$inferSelect;
 
-function rowToRecord(row: RouteRow): RouteRecord {
+function rowToRecord(row: RouteSelect): RouteRecord {
   return {
     slug: row.slug,
     port: row.port,
     description: row.description,
     status: row.status as RouteStatus,
-    cloudflareRecordId: row.cloudflare_record_id,
-    lastErrorCode: row.last_error_code,
-    lastErrorMessage: row.last_error_message,
-    retryCount: row.retry_count,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at),
+    cloudflareRecordId: row.cloudflareRecordId,
+    lastErrorCode: row.lastErrorCode,
+    lastErrorMessage: row.lastErrorMessage,
+    retryCount: row.retryCount,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -49,59 +41,64 @@ export interface RouteStore {
 }
 
 export class SqliteRouteStore implements RouteStore {
-  private sqlite: DatabaseContext['sqlite'];
+  private db: DatabaseContext['db'];
 
   constructor(ctx: DatabaseContext) {
-    this.sqlite = ctx.sqlite;
+    this.db = ctx.db;
   }
 
   async count(): Promise<number> {
-    const row = this.sqlite.prepare('SELECT COUNT(*) as count FROM routes').get() as { count: number };
-    return row.count;
+    const [row] = await this.db.select({ value: count() }).from(routes);
+    return row!.value;
   }
 
   async get(slug: string): Promise<RouteRecord | null> {
-    const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(slug) as unknown as
-      | RouteRow
-      | undefined;
+    const [row] = await this.db.select().from(routes).where(eq(routes.slug, slug)).limit(1);
     return row ? rowToRecord(row) : null;
   }
 
   async list(): Promise<RouteRecord[]> {
-    const rows = this.sqlite.prepare('SELECT * FROM routes ORDER BY slug').all() as unknown as RouteRow[];
+    const rows = await this.db.select().from(routes).orderBy(routes.slug);
     return rows.map(rowToRecord);
   }
 
   async listActive(): Promise<RouteRecord[]> {
-    const rows = this.sqlite
-      .prepare("SELECT * FROM routes WHERE status = 'active' ORDER BY slug")
-      .all() as unknown as RouteRow[];
+    const rows = await this.db
+      .select()
+      .from(routes)
+      .where(eq(routes.status, 'active'))
+      .orderBy(routes.slug);
     return rows.map(rowToRecord);
   }
 
   async listPending(): Promise<RouteRecord[]> {
-    const rows = this.sqlite
-      .prepare("SELECT * FROM routes WHERE status = 'deleting' ORDER BY slug")
-      .all() as unknown as RouteRow[];
+    const rows = await this.db
+      .select()
+      .from(routes)
+      .where(eq(routes.status, 'deleting'))
+      .orderBy(routes.slug);
     return rows.map(rowToRecord);
   }
 
   async insertCreating(input: { slug: string; port: number; description: string | null }): Promise<RouteRecord> {
-    const now = Date.now();
-    this.sqlite.exec('BEGIN');
+    const now = new Date();
     try {
-      this.sqlite
-        .prepare(
-          `INSERT INTO routes (slug, port, description, status, retry_count, created_at, updated_at)
-           VALUES (?, ?, ?, 'creating', 0, ?, ?)`,
-        )
-        .run(input.slug, input.port, input.description, now, now);
-      const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(input.slug) as unknown as RouteRow;
-      this.sqlite.exec('COMMIT');
-      return rowToRecord(row);
+      const [row] = await this.db
+        .insert(routes)
+        .values({
+          slug: input.slug,
+          port: input.port,
+          description: input.description,
+          status: 'creating',
+          retryCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        } satisfies RouteInsert)
+        .returning();
+      return rowToRecord(row!);
     } catch (e: unknown) {
-      this.sqlite.exec('ROLLBACK');
-      if (e instanceof Error && 'code' in e && (e as any).code === 'ERR_SQLITE_ERROR' && e.message.includes('UNIQUE')) {
+      const cause = (e as any).cause;
+      if (cause?.code === 'ERR_SQLITE_ERROR' && cause?.message?.includes('UNIQUE')) {
         throw new RouteManagerError('ROUTE_ALREADY_EXISTS', `route "${input.slug}" already exists`);
       }
       throw e;
@@ -109,147 +106,88 @@ export class SqliteRouteStore implements RouteStore {
   }
 
   async activate(slug: string, recordId: string | null): Promise<RouteRecord> {
-    const now = Date.now();
-    this.sqlite.exec('BEGIN');
-    try {
-      const result = this.sqlite
-        .prepare(
-          `UPDATE routes SET status = 'active', cloudflare_record_id = ?,
-           last_error_code = NULL, last_error_message = NULL,
-           retry_count = 0, updated_at = ?
-           WHERE slug = ?`,
-        )
-        .run(recordId, now, slug) as { changes: number; lastInsertRowid: number | bigint };
-      if (result.changes === 0) {
-        this.sqlite.exec('ROLLBACK');
-        throw ROUTE_NOT_FOUND;
-      }
-      const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(slug) as unknown as RouteRow;
-      this.sqlite.exec('COMMIT');
-      return rowToRecord(row);
-    } catch (e: unknown) {
-      if (e !== ROUTE_NOT_FOUND) {
-        this.sqlite.exec('ROLLBACK');
-      }
-      throw e;
-    }
+    const now = new Date();
+    const [row] = await this.db
+      .update(routes)
+      .set({
+        status: 'active',
+        cloudflareRecordId: recordId,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        retryCount: 0,
+        updatedAt: now,
+      })
+      .where(eq(routes.slug, slug))
+      .returning();
+    if (!row) throw ROUTE_NOT_FOUND;
+    return rowToRecord(row);
   }
 
   async updateActive(slug: string, patch: { port?: number; description?: string | null }): Promise<RouteRecord> {
-    const now = Date.now();
-    const sets: string[] = [];
-    const params: (string | number | null)[] = [];
-    if (patch.port !== undefined) {
-      sets.push('port = ?');
-      params.push(patch.port);
-    }
-    if (patch.description !== undefined) {
-      sets.push('description = ?');
-      params.push(patch.description);
-    }
-    sets.push('last_error_code = NULL');
-    sets.push('last_error_message = NULL');
-    sets.push('retry_count = 0');
-    sets.push('updated_at = ?');
-    params.push(now);
-    params.push(slug);
+    const now = new Date();
+    const values: Partial<RouteInsert> & { updatedAt: Date; lastErrorCode: null; lastErrorMessage: null; retryCount: 0 } = {
+      updatedAt: now,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      retryCount: 0,
+    };
+    if (patch.port !== undefined) values.port = patch.port;
+    if (patch.description !== undefined) values.description = patch.description;
 
-    const sql = `UPDATE routes SET ${sets.join(', ')} WHERE slug = ? AND status = 'active'`;
-
-    this.sqlite.exec('BEGIN');
-    try {
-      const result = this.sqlite.prepare(sql).run(...params) as { changes: number; lastInsertRowid: number | bigint };
-      if (result.changes === 0) {
-        this.sqlite.exec('ROLLBACK');
-        throw ROUTE_NOT_FOUND;
-      }
-      const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(slug) as unknown as RouteRow;
-      this.sqlite.exec('COMMIT');
-      return rowToRecord(row);
-    } catch (e: unknown) {
-      if (e !== ROUTE_NOT_FOUND) {
-        this.sqlite.exec('ROLLBACK');
-      }
-      throw e;
-    }
+    const [row] = await this.db
+      .update(routes)
+      .set(values)
+      .where(and(eq(routes.slug, slug), eq(routes.status, 'active')))
+      .returning();
+    if (!row) throw ROUTE_NOT_FOUND;
+    return rowToRecord(row);
   }
 
   async markDeleting(slug: string): Promise<RouteRecord> {
-    const now = Date.now();
-    this.sqlite.exec('BEGIN');
-    try {
-      const result = this.sqlite
-        .prepare('UPDATE routes SET status = \'deleting\', updated_at = ? WHERE slug = ?')
-        .run(now, slug) as { changes: number; lastInsertRowid: number | bigint };
-      if (result.changes === 0) {
-        this.sqlite.exec('ROLLBACK');
-        throw ROUTE_NOT_FOUND;
-      }
-      const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(slug) as unknown as RouteRow;
-      this.sqlite.exec('COMMIT');
-      return rowToRecord(row);
-    } catch (e: unknown) {
-      if (e !== ROUTE_NOT_FOUND) {
-        this.sqlite.exec('ROLLBACK');
-      }
-      throw e;
-    }
+    const now = new Date();
+    const [row] = await this.db
+      .update(routes)
+      .set({ status: 'deleting', updatedAt: now })
+      .where(eq(routes.slug, slug))
+      .returning();
+    if (!row) throw ROUTE_NOT_FOUND;
+    return rowToRecord(row);
   }
 
   async setCloudflareRecordId(slug: string, recordId: string): Promise<RouteRecord> {
-    const now = Date.now();
-    this.sqlite.exec('BEGIN');
-    try {
-      const result = this.sqlite
-        .prepare('UPDATE routes SET cloudflare_record_id = ?, updated_at = ? WHERE slug = ?')
-        .run(recordId, now, slug) as { changes: number; lastInsertRowid: number | bigint };
-      if (result.changes === 0) {
-        this.sqlite.exec('ROLLBACK');
-        throw ROUTE_NOT_FOUND;
-      }
-      const row = this.sqlite.prepare('SELECT * FROM routes WHERE slug = ?').get(slug) as unknown as RouteRow;
-      this.sqlite.exec('COMMIT');
-      return rowToRecord(row);
-    } catch (e: unknown) {
-      if (e !== ROUTE_NOT_FOUND) {
-        this.sqlite.exec('ROLLBACK');
-      }
-      throw e;
-    }
+    const now = new Date();
+    const [row] = await this.db
+      .update(routes)
+      .set({ cloudflareRecordId: recordId, updatedAt: now })
+      .where(eq(routes.slug, slug))
+      .returning();
+    if (!row) throw ROUTE_NOT_FOUND;
+    return rowToRecord(row);
   }
 
   async recordError(slug: string, error: { code: string; message: string }): Promise<void> {
-    const now = Date.now();
-    this.sqlite.exec('BEGIN');
-    try {
-      const result = this.sqlite
-        .prepare(
-          `UPDATE routes SET last_error_code = ?, last_error_message = ?,
-           retry_count = retry_count + 1, updated_at = ?
-           WHERE slug = ?`,
-        )
-        .run(error.code, error.message, now, slug) as { changes: number; lastInsertRowid: number | bigint };
-      if (result.changes === 0) {
-        this.sqlite.exec('ROLLBACK');
-        throw ROUTE_NOT_FOUND;
-      }
-      this.sqlite.exec('COMMIT');
-    } catch (e: unknown) {
-      if (e !== ROUTE_NOT_FOUND) {
-        this.sqlite.exec('ROLLBACK');
-      }
-      throw e;
-    }
+    const now = new Date();
+    const result = await this.db
+      .update(routes)
+      .set({
+        lastErrorCode: error.code,
+        lastErrorMessage: error.message,
+        retryCount: sql`retry_count + 1`,
+        updatedAt: now,
+      })
+      .where(eq(routes.slug, slug))
+      .returning();
+    if (result.length === 0) throw ROUTE_NOT_FOUND;
   }
 
   async remove(slug: string): Promise<void> {
-    this.sqlite.prepare('DELETE FROM routes WHERE slug = ?').run(slug);
+    await this.db.delete(routes).where(eq(routes.slug, slug));
   }
 
   async ping(): Promise<boolean> {
     try {
-      this.sqlite.prepare('SELECT 1').get();
-      return true;
+      const result = await this.db.get(sql`SELECT 1`);
+      return result !== undefined && result !== null;
     } catch {
       return false;
     }

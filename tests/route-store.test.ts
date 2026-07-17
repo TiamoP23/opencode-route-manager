@@ -157,4 +157,16 @@ describe('SqliteRouteStore', () => {
   it('ping returns true', async () => {
     expect(await store.ping()).toBe(true);
   });
+
+  it('provides a typed Drizzle database for direct queries', async () => {
+    const dir = join(import.meta.dirname, '..');
+    const ctx = openDatabase(dbPath, join(dir, 'drizzle'));
+    try {
+      const { routes } = await import('../src/db/schema.js');
+      const rows = await ctx.db.select().from(routes);
+      expect(rows).toEqual([]);
+    } finally {
+      ctx.close();
+    }
+  });
 });
