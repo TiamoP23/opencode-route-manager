@@ -28,8 +28,11 @@ function parseBoundedInt(
 ): number {
   const raw = env[key];
   if (raw === undefined) return def;
-  const val = parseInt(raw, 10);
-  if (Number.isNaN(val) || val < min || val > max) {
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${key}=${raw} must be an integer between ${min} and ${max}`);
+  }
+  const val = Number(raw);
+  if (!Number.isInteger(val) || val < min || val > max) {
     throw new Error(`${key}=${raw} must be an integer between ${min} and ${max}`);
   }
   return val;
@@ -37,10 +40,10 @@ function parseBoundedInt(
 
 function parseBoolean(env: Record<string, string | undefined>, key: string, def: boolean): boolean {
   const raw = env[key];
-  if (raw === undefined) return def;
+  if (raw === undefined || raw === '') return def;
   if (raw === 'true' || raw === '1') return true;
   if (raw === 'false' || raw === '0') return false;
-  return def;
+  throw new Error(`${key}=${raw} must be 'true', 'false', '1', or '0'`);
 }
 
 function parseLowercaseSet(
@@ -51,6 +54,19 @@ function parseLowercaseSet(
   const raw = env[key];
   const src = raw ?? def;
   return src.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function validatePortSet(members: string[]): number[] {
+  return members.map((m) => {
+    if (!/^\d+$/.test(m)) {
+      throw new Error(`DENIED_PORTS member "${m}" is not a valid port number`);
+    }
+    const port = Number(m);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`DENIED_PORTS member "${m}" is not a valid port number`);
+    }
+    return port;
+  });
 }
 
 export function loadConfig(env: Record<string, string | undefined>): AppConfig {
@@ -98,7 +114,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     middleware: env['TRAEFIK_MIDDLEWARE'] ?? 'dev-basic-auth@file',
     minPort: parseBoundedInt(env, 'MIN_PORT', 1024, 1, 65535),
     maxPort: parseBoundedInt(env, 'MAX_PORT', 65535, 1, 65535),
-    deniedPorts: new Set(parseLowercaseSet(env, 'DENIED_PORTS', '4096').map(Number)),
+    deniedPorts: new Set(validatePortSet(parseLowercaseSet(env, 'DENIED_PORTS', '4096'))),
     reservedSlugs: new Set(parseLowercaseSet(env, 'RESERVED_SLUGS', 'opencode,code,auth,traefik,dockge,grafana')),
     maxRoutes: parseBoundedInt(env, 'MAX_ROUTES', 32, 1, 1000),
     probeTimeoutMs: parseBoundedInt(env, 'PROBE_TIMEOUT_MS', 1000, 100, 60000),

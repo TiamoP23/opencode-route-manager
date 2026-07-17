@@ -41,4 +41,23 @@ describe('loadConfig', () => {
       cnameTarget: 'opencode.tiamop23.de', proxied: true,
     });
   });
+
+  it('rejects non-integer values in port variables', () => {
+    expect(() => loadConfig({ ...required, LISTEN_PORT: '3000junk' })).toThrow(/LISTEN_PORT/);
+    expect(() => loadConfig({ ...required, LISTEN_PORT: '1.5' })).toThrow(/LISTEN_PORT/);
+    expect(() => loadConfig({ ...required, LISTEN_PORT: '' })).toThrow(/LISTEN_PORT/);
+  });
+
+  it('rejects invalid DENIED_PORTS members', () => {
+    expect(() => loadConfig({ ...required, DENIED_PORTS: 'abc' })).toThrow(/DENIED_PORTS/);
+    expect(() => loadConfig({ ...required, DENIED_PORTS: '4096,abc' })).toThrow(/DENIED_PORTS/);
+    expect(() => loadConfig({ ...required, DENIED_PORTS: '0' })).toThrow(/DENIED_PORTS/);
+    expect(() => loadConfig({ ...required, DENIED_PORTS: '70000' })).toThrow(/DENIED_PORTS/);
+    expect(() => loadConfig({ ...required, DENIED_PORTS: '1.5' })).toThrow(/DENIED_PORTS/);
+  });
+
+  it('rejects invalid CLOUDFLARE_PROXIED values', () => {
+    expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'yes' })).toThrow(/CLOUDFLARE_PROXIED/);
+    expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'no' })).toThrow(/CLOUDFLARE_PROXIED/);
+  });
 });

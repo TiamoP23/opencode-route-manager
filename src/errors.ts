@@ -45,11 +45,12 @@ export class RouteManagerError extends Error {
   }
 }
 
+const SANITIZED_MESSAGE = 'An internal error occurred';
+
 export function errorResult(error: unknown): ToolError {
   if (error instanceof RouteManagerError) {
     return { code: error.code, message: error.message, retryable: error.retryable };
   }
 
-  const message = error instanceof Error ? error.message : String(error);
-  return { code: 'INTERNAL_ERROR', message, retryable: true };
+  return { code: 'INTERNAL_ERROR', message: SANITIZED_MESSAGE, retryable: true };
 }
