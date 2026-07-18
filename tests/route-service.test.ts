@@ -6,6 +6,7 @@ import type {
 import type { AppConfig } from '../src/config.js';
 import { RouteManagerError } from '../src/errors.js';
 import { RouteService } from '../src/route-service.js';
+import { KeyedLock } from '../src/keyed-lock.js';
 
 // ---------------------------------------------------------------------------
 // Shared event log — single timeline emitted by every fake
@@ -51,6 +52,16 @@ class SharedEventLog {
     return this.entries.findIndex(
       (e) => e.source === source && e.method === method,
     );
+  }
+
+  /**
+   * Return `source.method` strings excluding internal read-only (store.get)
+   * calls, suitable for exact-array matching with toEqual().
+   */
+  significant(): string[] {
+    return this.entries
+      .filter((e) => !(e.source === 'store' && e.method === 'get'))
+      .map((e) => `${e.source}.${e.method}`);
   }
 }
 
@@ -352,6 +363,26 @@ describe('RouteService', () => {
       expect(r2.description).toBeNull();
     });
 
+    it('rejects non-string description types at runtime', async () => {
+      // number
+      await expect(
+        svc.publish({ slug: 'desc-num', port: 3000, description: 42 as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+      expect(log.entries.length).toBe(0);
+
+      // boolean
+      await expect(
+        svc.publish({ slug: 'desc-bool', port: 3000, description: true as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+      expect(log.entries.length).toBe(0);
+
+      // object
+      await expect(
+        svc.publish({ slug: 'desc-obj', port: 3000, description: {} as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+      expect(log.entries.length).toBe(0);
+    });
+
     it('full event order with Cloudflare', async () => {
       await svc.publish({
         slug: 'my-app',
@@ -359,12 +390,9 @@ describe('RouteService', () => {
         description: 'My App',
       });
 
-      const merged = log.merged();
-      // Key events in order (store.get, store.count early, probe,
-      // dns.assertAvailable, store.count re-count, store.insertCreating,
-      // dns.ensureRecord, store.setCloudflareRecordId, store.activate)
-      const seq = [
-        'store.get',
+      // Exact significant event order for publish with DNS:
+      // get → early count → probe → assertAvailable → re-count → insertCreating → ensureRecord → setCloudflareRecordId → activate
+      expect(log.significant()).toEqual([
         'store.count',
         'probe.probe',
         'dns.assertAvailable',
@@ -373,22 +401,7 @@ describe('RouteService', () => {
         'dns.ensureRecord',
         'store.setCloudflareRecordId',
         'store.activate',
-      ];
-      expect(merged).toEqual(expect.arrayContaining(seq));
-      expect(log.containsSubsequence(seq)).toBe(true);
-
-      // store.count appears twice (early + re-count)
-      const countEntries = merged.filter((m) => m === 'store.count');
-      expect(countEntries.length).toBe(2);
-
-      // Early count precedes probe; re-count precedes insertCreating
-      const firstCount = merged.indexOf('store.count');
-      const secondCount = merged.lastIndexOf('store.count');
-      const probeIdx = merged.indexOf('probe.probe');
-      const insertIdx = merged.indexOf('store.insertCreating');
-      expect(firstCount).toBeLessThan(probeIdx);
-      expect(secondCount).toBeGreaterThan(probeIdx);
-      expect(secondCount).toBeLessThan(insertIdx);
+      ]);
     });
 
     it('publish without Cloudflare: store.get count probe count insertCreating activate', async () => {
@@ -401,16 +414,13 @@ describe('RouteService', () => {
 
       await nd.publish({ slug: 'no-dns', port: 5173 });
 
-      const merged = log.merged();
-      const seq = [
-        'store.get',
+      expect(log.significant()).toEqual([
         'store.count',
         'probe.probe',
         'store.count',
         'store.insertCreating',
         'store.activate',
-      ];
-      expect(log.containsSubsequence(seq)).toBe(true);
+      ]);
       // No DNS entries
       expect(log.sourceMethods('dns').length).toBe(0);
     });
@@ -548,6 +558,37 @@ describe('RouteService', () => {
       expect(row!.port).toBe(3000);
     });
 
+    it('validates port policy before acquiring slug lock', async () => {
+      await svc.publish({ slug: 'pre-lock-upd', port: 3000 });
+      log.clear();
+
+      // Sub-min port should fail without any store/DNS interactions
+      await expect(
+        svc.update({ slug: 'pre-lock-upd', port: 1 }),
+      ).rejects.toThrow(RouteManagerError);
+
+      expect(log.entries.length).toBe(0);
+    });
+
+    it('validates description before acquiring slug lock', async () => {
+      await svc.publish({ slug: 'pre-lock-desc', port: 3000 });
+      log.clear();
+
+      // Too-long description should fail without any store interactions
+      await expect(
+        svc.update({ slug: 'pre-lock-desc', description: 'x'.repeat(201) }),
+      ).rejects.toThrow(RouteManagerError);
+
+      expect(log.entries.length).toBe(0);
+
+      // Non-string type should also fail before locking
+      await expect(
+        svc.update({ slug: 'pre-lock-desc', description: 99 as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+
+      expect(log.entries.length).toBe(0);
+    });
+
     it('validates description as string | null | undefined, max 200', async () => {
       await svc.publish({ slug: 'desc-upd', port: 3000, description: 'orig' });
 
@@ -562,6 +603,28 @@ describe('RouteService', () => {
       // too long
       await expect(
         svc.update({ slug: 'desc-upd', description: 'x'.repeat(201) }),
+      ).rejects.toThrow(RouteManagerError);
+    });
+
+    it('rejects non-string description types at runtime before side effects', async () => {
+      await svc.publish({ slug: 'desc-type-upd', port: 3000 });
+      log.clear();
+
+      // number
+      await expect(
+        svc.update({ slug: 'desc-type-upd', description: 42 as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+      // No store or probe calls before the lock
+      expect(log.merged()).not.toContain('store.get');
+
+      // boolean
+      await expect(
+        svc.update({ slug: 'desc-type-upd', description: true as unknown as string }),
+      ).rejects.toThrow(RouteManagerError);
+
+      // object
+      await expect(
+        svc.update({ slug: 'desc-type-upd', description: {} as unknown as string }),
       ).rejects.toThrow(RouteManagerError);
     });
 
@@ -720,36 +783,52 @@ describe('RouteService', () => {
       expect(doc.http.routers['agent-del-fail']).toBeUndefined();
     });
 
+    it('persists findOwnedRecord errors in performDnsCleanup', async () => {
+      // Create a route with no cloudflareRecordId so findOwnedRecord is called
+      await store.insertCreating({ slug: 'find-err-rm', port: 3000, description: null });
+      dns._addRecord('find-err-rm.tiamop23.de', 'find-err-rm', 'cf-find-err');
+      await store.activate('find-err-rm', null);
+
+      // Make findOwnedRecord throw
+      dns.findOwnedRecord = async () => {
+        throw new RouteManagerError('DNS_UNAVAILABLE', 'find failed');
+      };
+
+      await expect(svc.remove('find-err-rm')).rejects.toThrow(RouteManagerError);
+
+      const row = await store.get('find-err-rm');
+      expect(row).not.toBeNull();
+      expect(row!.status).toBe('deleting');
+      expect(row!.lastErrorCode).toBe('DNS_UNAVAILABLE');
+    });
+
     it('full event order for remove with Cloudflare', async () => {
       await svc.publish({ slug: 'order-rm', port: 3000 });
       log.clear();
 
       await svc.remove('order-rm');
 
-      const seq = [
-        'store.get',
+      expect(log.significant()).toEqual([
         'store.markDeleting',
         'dns.deleteRecord',
         'store.remove',
-      ];
-      expect(log.containsSubsequence(seq)).toBe(true);
+      ]);
     });
 
     it('full event order for remove with missing-id recovery', async () => {
       await store.insertCreating({ slug: 'order-rec', port: 3000, description: null });
       dns._addRecord('order-rec.tiamop23.de', 'order-rec', 'cf-rec99');
+      log.clear();
 
       await svc.remove('order-rec');
 
-      const seq = [
-        'store.get',
+      expect(log.significant()).toEqual([
         'store.markDeleting',
         'dns.findOwnedRecord',
         'store.setCloudflareRecordId',
         'dns.deleteRecord',
         'store.remove',
-      ];
-      expect(log.containsSubsequence(seq)).toBe(true);
+      ]);
     });
   });
 
@@ -997,6 +1076,95 @@ describe('RouteService', () => {
         (m) => m === 'insertCreating' || m === 'activate' || m === 'remove',
       );
       expect(storeMuts.length).toBe(0);
+    });
+
+    it('reconcile continues processing later rows after one fails', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'fail-row', port: 3000, description: null });
+      dns._addRecord('fail-row.tiamop23.de', 'fail-row', 'cf-fail');
+      await store.insertCreating({ slug: 'good-row', port: 3001, description: null });
+      dns._addRecord('good-row.tiamop23.de', 'good-row', 'cf-good');
+      vi.advanceTimersByTime(2000);
+
+      // Make ensureRecord throw for the first row only
+      let callCount = 0;
+      const origEnsure = dns.ensureRecord.bind(dns);
+      dns.ensureRecord = async (hostname, slug) => {
+        callCount++;
+        if (callCount === 1) throw new RouteManagerError('DNS_UNAVAILABLE', 'first fail');
+        return origEnsure(hostname, slug);
+      };
+
+      log.clear();
+      await svc.reconcilePending();
+
+      // First row failed but error was persisted
+      const failRow = await store.get('fail-row');
+      expect(failRow).not.toBeNull();
+      expect(failRow!.status).toBe('creating');
+      expect(failRow!.lastErrorCode).toBe('DNS_UNAVAILABLE');
+
+      // Second row was still processed and activated
+      const goodRow = await store.get('good-row');
+      expect(goodRow).not.toBeNull();
+      expect(goodRow!.status).toBe('active');
+    });
+
+    it('reconcile re-checks backoff from fresh row after slug lock', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'backoff-recheck', port: 3000, description: null });
+      dns._addRecord('backoff-recheck.tiamop23.de', 'backoff-recheck', 'cf-br');
+      // Advance time just enough to pass the initial backoff
+      vi.advanceTimersByTime(1100);
+      log.clear();
+
+      // Now manually update the row's updatedAt to simulate a recent change
+      // (e.g., another reconciler already tried it)
+      const rawData = store._rawData();
+      const row = rawData.get('backoff-recheck')!;
+      row.updatedAt = new Date(); // Set to current fake time
+
+      await svc.reconcilePending();
+
+      // The reconciler should re-check backoff inside the slug lock using
+      // the fresh updatedAt, and skip the row since backoff is not due
+      const current = await store.get('backoff-recheck');
+      expect(current).not.toBeNull();
+      expect(current!.status).toBe('creating');
+      // No probe or DNS calls since backoff re-check skipped processing
+      expect(log.significant()).toEqual(['store.listPending']);
+    });
+
+    it('reconcile creating: concurrent slug lock queues behind lock, re-evaluates stale row', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'conc-re-eval', port: 3000, description: null });
+      dns._addRecord('conc-re-eval.tiamop23.de', 'conc-re-eval', 'cf-cre');
+      vi.advanceTimersByTime(2000);
+
+      // Hold the slug lock by running an operation that blocks
+      let release: () => void;
+      const blocked = new Promise<void>((r) => { release = r; });
+      const slugLock = (svc as unknown as { slugLock: KeyedLock }).slugLock;
+      const holdPromise = slugLock.run('conc-re-eval', () => blocked);
+
+      // Start reconcile — it queues behind the held lock
+      log.clear();
+      const reconcilePromise = svc.reconcilePending();
+
+      // While reconcile is queued, manually activate the row
+      await store.activate('conc-re-eval', null);
+
+      // Now release the lock — reconcile's callback runs
+      release!();
+      await holdPromise;
+      await reconcilePromise;
+
+      // Reconciler should re-read the row, see it's already active, and skip
+      const final = await store.get('conc-re-eval');
+      expect(final).not.toBeNull();
+      expect(final!.status).toBe('active');
+      // No DNS calls from reconciler (would indicate it tried to process the row)
+      expect(log.sourceMethods('dns').length).toBe(0);
     });
   });
 });

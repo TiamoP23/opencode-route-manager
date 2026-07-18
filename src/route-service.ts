@@ -20,6 +20,27 @@ import { KeyedLock } from './keyed-lock.js';
 const MAX_DESCRIPTION_LENGTH = 200;
 
 /**
+ * Runtime description validator that rejects non-string types and enforces
+ * the maximum length. Accepts null and undefined (which clear the field).
+ * Throws RouteManagerError with INVALID_SLUG on failure.
+ */
+function validateDescription(value: unknown): void {
+  if (value === null || value === undefined) return;
+  if (typeof value !== 'string') {
+    throw new RouteManagerError(
+      'INVALID_SLUG',
+      'description must be a string',
+    );
+  }
+  if (value.length > MAX_DESCRIPTION_LENGTH) {
+    throw new RouteManagerError(
+      'INVALID_SLUG',
+      `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`,
+    );
+  }
+}
+
+/**
  * Error codes that the reconciler automatically retries.
  */
 const RETRYABLE_CODES = new Set(['DNS_UNAVAILABLE', 'PORT_UNREACHABLE']);
@@ -64,12 +85,7 @@ export class RouteService {
     // 1. Validate before any side effects
     validateSlug(input.slug, this.config);
     validatePort(input.port, this.config);
-    if (description !== null && description.length > MAX_DESCRIPTION_LENGTH) {
-      throw new RouteManagerError(
-        'INVALID_SLUG',
-        `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`,
-      );
-    }
+    validateDescription(input.description);
 
     return this.slugLock.run(input.slug, async () => {
       // 2. Re-read state after acquiring the slug lock
@@ -153,8 +169,12 @@ export class RouteService {
   // -------------------------------------------------------------------------
 
   async update(input: UpdateInput): Promise<RouteRecord> {
-    // Validate slug before any side effects
+    // Validate before any side effects (all checks before slug lock)
     validateSlug(input.slug, this.config);
+    validateDescription(input.description);
+    if (input.port !== undefined) {
+      validatePort(input.port, this.config);
+    }
 
     return this.slugLock.run(input.slug, async () => {
       const route = await this.store.get(input.slug);
@@ -168,19 +188,8 @@ export class RouteService {
       const portChanged = input.port !== undefined && input.port !== route.port;
       const descProvided = input.description !== undefined;
 
-      // Validate description with safe runtime narrowing
-      const desc = input.description;
-      if (descProvided && desc !== null && desc !== undefined && desc.length > MAX_DESCRIPTION_LENGTH) {
-        throw new RouteManagerError(
-          'INVALID_SLUG',
-          `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`,
-        );
-      }
-
-      // Validate replacement port with configured policy before probing
+      // Probe replacement port only when it actually changed (inside lock)
       if (portChanged) {
-        validatePort(input.port!, this.config);
-
         const reachable = await this.probe(
           this.config.upstreamHost,
           input.port!,
@@ -254,73 +263,97 @@ export class RouteService {
     const now = Date.now();
 
     for (const row of pending) {
-      // Backoff: 2^min(retryCount,8) * 1000ms, capped at 300s, + 0–20% jitter
-      const baseDelay = Math.min(
-        300_000,
-        1_000 * 2 ** Math.min(row.retryCount, 8),
-      );
-      const jitteredDelay = baseDelay * (1 + 0.2 * Math.random());
-      if (now - row.updatedAt.getTime() < jitteredDelay) continue;
+      try {
+        // Backoff: 2^min(retryCount,8) * 1000ms, capped at 300s, + 0–20% jitter
+        const baseDelay = Math.min(
+          300_000,
+          1_000 * 2 ** Math.min(row.retryCount, 8),
+        );
+        const jitteredDelay = baseDelay * (1 + 0.2 * Math.random());
+        if (now - row.updatedAt.getTime() < jitteredDelay) continue;
 
-      if (row.status === 'creating') {
-        await this.slugLock.run(row.slug, async () => {
-          // Re-read and re-evaluate status, retryability, backoff
-          const current = await this.store.get(row.slug);
-          if (!current || current.status !== 'creating') return;
+        if (row.status === 'creating') {
+          await this.slugLock.run(row.slug, async () => {
+            // Re-read and re-evaluate status, retryability, backoff
+            const current = await this.store.get(row.slug);
+            if (!current || current.status !== 'creating') return;
 
-          // Re-evaluate retryability from fresh row
-          if (current.lastErrorCode !== null &&
-              !RETRYABLE_CODES.has(current.lastErrorCode)) {
-            return; // Non-retryable — skip
-          }
+            // Re-check backoff from fresh row (handles stale rows or
+            // concurrent reconciler processing)
+            const freshNow = Date.now();
+            const baseDelay2 = Math.min(
+              300_000,
+              1_000 * 2 ** Math.min(current.retryCount, 8),
+            );
+            const jitteredDelay2 = baseDelay2 * (1 + 0.2 * Math.random());
+            if (freshNow - current.updatedAt.getTime() < jitteredDelay2) return;
 
-          const reachable = await this.probe(
-            this.config.upstreamHost,
-            current.port,
-            this.config.probeTimeoutMs,
-          );
-          if (!reachable) {
-            await this.store.recordError(row.slug, {
-              code: 'PORT_UNREACHABLE',
-              message: `port ${current.port} on ${this.config.upstreamHost} is not reachable`,
-            });
-            return;
-          }
+            // Re-evaluate retryability from fresh row
+            if (current.lastErrorCode !== null &&
+                !RETRYABLE_CODES.has(current.lastErrorCode)) {
+              return; // Non-retryable — skip
+            }
 
-          let recordId: string | null = null;
-          if (this.dns) {
-            try {
-              const hostname = `${current.slug}.${this.config.publicDomain}`;
-              const dnsRecord = await this.dns.ensureRecord(hostname, current.slug);
-              await this.store.setCloudflareRecordId(current.slug, dnsRecord.id);
-              recordId = dnsRecord.id;
-            } catch (err) {
-              const sanitized = err instanceof RouteManagerError
-                ? err
-                : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
-              await this.store.recordError(current.slug, { code: sanitized.code, message: sanitized.message });
+            const reachable = await this.probe(
+              this.config.upstreamHost,
+              current.port,
+              this.config.probeTimeoutMs,
+            );
+            if (!reachable) {
+              await this.store.recordError(row.slug, {
+                code: 'PORT_UNREACHABLE',
+                message: `port ${current.port} on ${this.config.upstreamHost} is not reachable`,
+              });
               return;
             }
-          }
 
-          await this.store.activate(current.slug, recordId);
-        });
-      } else if (row.status === 'deleting') {
-        await this.slugLock.run(row.slug, async () => {
-          // Re-read and re-evaluate status, retryability, backoff
-          const current = await this.store.get(row.slug);
-          if (!current || current.status !== 'deleting') return;
+            let recordId: string | null = null;
+            if (this.dns) {
+              try {
+                const hostname = `${current.slug}.${this.config.publicDomain}`;
+                const dnsRecord = await this.dns.ensureRecord(hostname, current.slug);
+                await this.store.setCloudflareRecordId(current.slug, dnsRecord.id);
+                recordId = dnsRecord.id;
+              } catch (err) {
+                const sanitized = err instanceof RouteManagerError
+                  ? err
+                  : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
+                await this.store.recordError(current.slug, { code: sanitized.code, message: sanitized.message });
+                return;
+              }
+            }
 
-          // Same retryability gate as creating — only auto-retry retryable errors
-          if (current.lastErrorCode !== null &&
-              !RETRYABLE_CODES.has(current.lastErrorCode)) {
-            return; // Non-retryable — skip
-          }
+            await this.store.activate(current.slug, recordId);
+          });
+        } else if (row.status === 'deleting') {
+          await this.slugLock.run(row.slug, async () => {
+            // Re-read and re-evaluate status, retryability, backoff
+            const current = await this.store.get(row.slug);
+            if (!current || current.status !== 'deleting') return;
 
-          await this.performDnsCleanup(current.slug);
+            // Re-check backoff from fresh row
+            const freshNow = Date.now();
+            const baseDelay2 = Math.min(
+              300_000,
+              1_000 * 2 ** Math.min(current.retryCount, 8),
+            );
+            const jitteredDelay2 = baseDelay2 * (1 + 0.2 * Math.random());
+            if (freshNow - current.updatedAt.getTime() < jitteredDelay2) return;
 
-          await this.store.remove(current.slug);
-        });
+            // Same retryability gate as creating — only auto-retry retryable errors
+            if (current.lastErrorCode !== null &&
+                !RETRYABLE_CODES.has(current.lastErrorCode)) {
+              return; // Non-retryable — skip
+            }
+
+            await this.performDnsCleanup(current.slug);
+
+            await this.store.remove(current.slug);
+          });
+        }
+      } catch {
+        // Internal handlers (e.g. performDnsCleanup) already persisted
+        // the error. Swallow so later rows continue processing.
       }
     }
   }
@@ -350,14 +383,22 @@ export class RouteService {
 
     // Recover missing Cloudflare record ID
     if (!recordId) {
-      const found = await this.dns.findOwnedRecord(hostname, slug);
-      if (found) {
-        await this.store.setCloudflareRecordId(slug, found.id);
-        // Re-read to get the updated record with recovered ID
-        const updated = await this.store.get(slug);
-        if (updated) {
-          recordId = updated.cloudflareRecordId;
+      try {
+        const found = await this.dns.findOwnedRecord(hostname, slug);
+        if (found) {
+          await this.store.setCloudflareRecordId(slug, found.id);
+          // Re-read to get the updated record with recovered ID
+          const updated = await this.store.get(slug);
+          if (updated) {
+            recordId = updated.cloudflareRecordId;
+          }
         }
+      } catch (err) {
+        const sanitized = err instanceof RouteManagerError
+          ? err
+          : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
+        await this.store.recordError(slug, { code: sanitized.code, message: sanitized.message });
+        throw err;
       }
     }
 
