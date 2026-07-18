@@ -3,6 +3,7 @@ import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
 import type { PublishInput, RouteRecord, UpdateInput } from './domain.js';
 import type { RouteService } from './route-service.js';
+import { RouteManagerError } from './errors.js';
 import type { RouteErrorCode } from './errors.js';
 
 // ---------------------------------------------------------------------------
@@ -49,8 +50,8 @@ const routeOutput = z.object({
       message: z.string(),
     })
     .nullable(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
 });
 
 const publishOutput = z.object({
@@ -84,7 +85,16 @@ function toRouteOutput(record: RouteRecord) {
     status: record.status,
     dnsRecordId: record.cloudflareRecordId,
     error: record.lastErrorCode
-      ? { code: record.lastErrorCode, message: record.lastErrorMessage ?? '' }
+      ? {
+          code:
+            record.lastErrorCode in MCP_ERROR_MESSAGES
+              ? record.lastErrorCode
+              : DEFAULT_INTERNAL_CODE,
+          message:
+            record.lastErrorCode in MCP_ERROR_MESSAGES
+              ? MCP_ERROR_MESSAGES[record.lastErrorCode]!
+              : DEFAULT_INTERNAL_MSG,
+        }
       : null,
     createdAt: record.createdAt.toISOString(),
     updatedAt: record.updatedAt.toISOString(),
@@ -120,18 +130,15 @@ async function toToolResult<T>(operation: () => Promise<T>): Promise<ToolSuccess
       structuredContent: output,
     };
   } catch (err) {
-    const isRouteError = err instanceof Error && 'code' in err && typeof (err as { code: unknown }).code === 'string';
+    const isRouteError = err instanceof RouteManagerError;
     const errCode: RouteErrorCode = isRouteError
-      ? (err as { code: RouteErrorCode }).code
+      ? err.code
       : DEFAULT_INTERNAL_CODE;
     const message: string =
       errCode in MCP_ERROR_MESSAGES
         ? MCP_ERROR_MESSAGES[errCode]!
         : DEFAULT_INTERNAL_MSG;
-    const retryable =
-      err instanceof Error && 'retryable' in err
-        ? (err as { retryable: boolean }).retryable
-        : true;
+    const retryable = isRouteError ? err.retryable : true;
 
     const errorPayload = { code: errCode, message, retryable };
 

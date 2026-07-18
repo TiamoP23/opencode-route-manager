@@ -7,6 +7,7 @@ import type { AppConfig } from '../src/config.js';
 import { RouteManagerError } from '../src/errors.js';
 import { RouteService } from '../src/route-service.js';
 import { createMcpServer } from '../src/mcp.js';
+import * as z from 'zod/v4';
 
 // ---------------------------------------------------------------------------
 // Fake RouteStore — minimal in-memory implementation
@@ -640,5 +641,148 @@ describe('MCP tools', () => {
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body.service.dnsRecordId).toBeNull();
     expect(body.service.error).toBeNull();
+  });
+
+  // -----------------------------------------------------------------------
+  // Timestamp schema: strict ISO datetime (format: date-time)
+  // -----------------------------------------------------------------------
+
+  it('timestamps satisfy strict z.iso.datetime() validation', async () => {
+    await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'ts-schema', port: 5000 },
+    });
+
+    const callResult = await client.callTool({
+      name: 'list_services',
+      arguments: {},
+    }) as CallResult;
+
+    const body = JSON.parse(callResult.content[0]!.text);
+    const svc = body.services[0];
+    const createdAtResult = z.iso.datetime().safeParse(svc.createdAt);
+    const updatedAtResult = z.iso.datetime().safeParse(svc.updatedAt);
+    expect(createdAtResult.success).toBe(true);
+    expect(updatedAtResult.success).toBe(true);
+  });
+
+  // -----------------------------------------------------------------------
+  // Structural errors (non-RouteManagerError) → INTERNAL_ERROR
+  // -----------------------------------------------------------------------
+
+  it('maps structural error with code property but non-RouteManagerError to INTERNAL_ERROR', async () => {
+    // A throwing probe that mimics an Error-like object (e.g. ECONNREFUSED)
+    const structuralErrorService = new RouteService({
+      config: testConfig(),
+      store: new FakeRouteStore(),
+      dns: null,
+      probe: async () => {
+        const e = new Error('connect ECONNREFUSED 127.0.0.1:3000');
+        (e as any).code = 'ECONNREFUSED';
+        (e as any).errno = -111;
+        (e as any).syscall = 'connect';
+        throw e;
+      },
+    });
+
+    const mcpServer = createMcpServer(structuralErrorService);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const throwingClient = new Client(
+      { name: 'test-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    await Promise.all([
+      throwingClient.connect(ct),
+      mcpServer.connect(st),
+    ]);
+
+    const callResult = await throwingClient.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'struct-err', port: 3000 },
+    }) as CallResult;
+
+    expect(callResult.isError).toBe(true);
+    const body = JSON.parse(callResult.content[0]!.text);
+    expect(body.error).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'An internal error occurred.',
+      retryable: true,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // toRouteOutput: listed routes with persisted errors use fixed messages
+  // -----------------------------------------------------------------------
+
+  it('list_services returns routes with errors using fixed MCP-safe messages, not persisted messages', async () => {
+    // Pre-populate store with a route that has a persisted error
+    const now = new Date();
+    const routeWithPersistedError: RouteRecord = {
+      slug: 'err-route',
+      port: 3000,
+      description: 'has error',
+      status: 'active',
+      cloudflareRecordId: null,
+      lastErrorCode: 'DNS_UNAVAILABLE',
+      lastErrorMessage: 'sensitive@internal.host: timeout contacting 10.0.0.1',
+      retryCount: 3,
+      createdAt: now,
+      updatedAt: now,
+    };
+    (store as unknown as { data: Map<string, RouteRecord> }).data.set(
+      'err-route',
+      routeWithPersistedError,
+    );
+
+    const callResult = await client.callTool({
+      name: 'list_services',
+      arguments: {},
+    }) as CallResult;
+
+    const body = JSON.parse(callResult.content[0]!.text);
+    expect(body.services).toHaveLength(1);
+    const svc = body.services[0];
+    expect(svc.error).toEqual({
+      code: 'DNS_UNAVAILABLE',
+      message: 'DNS service is currently unavailable. Please retry.',
+    });
+    // Must not contain sensitive persisted values
+    const text = JSON.stringify(body);
+    expect(text).not.toContain('sensitive');
+    expect(text).not.toContain('10.0.0.1');
+    expect(text).not.toContain('timeout');
+  });
+
+  it('list_services returns routes with unknown persisted error as INTERNAL_ERROR', async () => {
+    const now = new Date();
+    const routeWithUnknownError: RouteRecord = {
+      slug: 'unknown-err',
+      port: 4000,
+      description: 'unknown code',
+      status: 'active',
+      cloudflareRecordId: null,
+      lastErrorCode: 'UNKNOWN_DB_CODE',    // not in MCP_ERROR_MESSAGES
+      lastErrorMessage: 'internal details about failure xyz',
+      retryCount: 2,
+      createdAt: now,
+      updatedAt: now,
+    };
+    (store as unknown as { data: Map<string, RouteRecord> }).data.set(
+      'unknown-err',
+      routeWithUnknownError,
+    );
+
+    const callResult = await client.callTool({
+      name: 'list_services',
+      arguments: {},
+    }) as CallResult;
+
+    const body = JSON.parse(callResult.content[0]!.text);
+    expect(body.services).toHaveLength(1);
+    const svc = body.services[0];
+    expect(svc.error).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'An internal error occurred.',
+    });
   });
 });
