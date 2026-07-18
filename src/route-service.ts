@@ -20,9 +20,14 @@ import { KeyedLock } from './keyed-lock.js';
 const MAX_DESCRIPTION_LENGTH = 200;
 
 /**
+ * Error codes that the reconciler automatically retries.
+ */
+const RETRYABLE_CODES = new Set(['DNS_UNAVAILABLE', 'PORT_UNREACHABLE']);
+
+/**
  * Orchestrates the route lifecycle:
  *
- *   validate → probe → DNS preflight → [global lock: count + insertCreating]
+ *   validate → [global lock: count + insertCreating]
  *   → DNS mutation → activate
  *
  * The security ordering guarantees: no persistence before validation/probe,
@@ -76,7 +81,16 @@ export class RouteService {
         );
       }
 
-      // 3. Probe upstream port before persistence
+      // 3. Early capacity check — fast failure before probe/DNS
+      const earlyCount = await this.store.count();
+      if (earlyCount >= this.config.maxRoutes) {
+        throw new RouteManagerError(
+          'ROUTE_LIMIT_REACHED',
+          `route limit of ${this.config.maxRoutes} reached`,
+        );
+      }
+
+      // 4. Probe upstream port before persistence
       const reachable = await this.probe(
         this.config.upstreamHost,
         input.port,
@@ -91,12 +105,12 @@ export class RouteService {
 
       const hostname = `${input.slug}.${this.config.publicDomain}`;
 
-      // 4. DNS preflight
+      // 5. DNS preflight
       if (this.dns) {
         await this.dns.assertAvailable(hostname, input.slug);
       }
 
-      // 5. Global capacity lock: count + insertCreating
+      // 6. Global capacity lock: re-count + insertCreating (closes races)
       const route = await this.globalLock.run('__global_capacity__', async () => {
         const total = await this.store.count();
         if (total >= this.config.maxRoutes) {
@@ -113,7 +127,7 @@ export class RouteService {
       });
       // Global lock released — no more capacity checks.
 
-      // 6. DNS mutation (creating before DNS)
+      // 7. DNS mutation (creating before DNS)
       let recordId: string | null = null;
       if (this.dns) {
         try {
@@ -129,7 +143,7 @@ export class RouteService {
         }
       }
 
-      // 7. Active only after DNS success
+      // 8. Active only after DNS success
       return this.store.activate(input.slug, recordId);
     });
   }
@@ -139,6 +153,9 @@ export class RouteService {
   // -------------------------------------------------------------------------
 
   async update(input: UpdateInput): Promise<RouteRecord> {
+    // Validate slug before any side effects
+    validateSlug(input.slug, this.config);
+
     return this.slugLock.run(input.slug, async () => {
       const route = await this.store.get(input.slug);
       if (!route) {
@@ -151,16 +168,19 @@ export class RouteService {
       const portChanged = input.port !== undefined && input.port !== route.port;
       const descProvided = input.description !== undefined;
 
-      // Validate description
-      if (descProvided && input.description !== null && input.description!.length > MAX_DESCRIPTION_LENGTH) {
+      // Validate description with safe runtime narrowing
+      const desc = input.description;
+      if (descProvided && desc !== null && desc !== undefined && desc.length > MAX_DESCRIPTION_LENGTH) {
         throw new RouteManagerError(
           'INVALID_SLUG',
           `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`,
         );
       }
 
-      // Probe replacement port before changing active route
+      // Validate replacement port with configured policy before probing
       if (portChanged) {
+        validatePort(input.port!, this.config);
+
         const reachable = await this.probe(
           this.config.upstreamHost,
           input.port!,
@@ -174,7 +194,8 @@ export class RouteService {
         }
       }
 
-      // Build patch — description null explicitly clears it
+      // Build patch — description null explicitly clears it.
+      // After the descProvided guard, input.description is string | null.
       const patch: { port?: number; description?: string | null } = {};
       if (portChanged) patch.port = input.port!;
       if (descProvided) patch.description = input.description as string | null;
@@ -190,6 +211,9 @@ export class RouteService {
   async remove(
     slug: string,
   ): Promise<{ slug: string; removed: boolean }> {
+    // Validate slug before any side effects
+    validateSlug(slug, this.config);
+
     return this.slugLock.run(slug, async () => {
       const route = await this.store.get(slug);
       if (!route) return { slug, removed: false };
@@ -197,36 +221,7 @@ export class RouteService {
       // Mark deleting before DNS mutation
       await this.store.markDeleting(slug);
 
-      if (this.dns) {
-        try {
-          const hostname = `${slug}.${this.config.publicDomain}`;
-          let recordId = route.cloudflareRecordId;
-
-          // Recover missing Cloudflare record ID
-          if (!recordId) {
-            const found = await this.dns.findOwnedRecord(hostname, slug);
-            if (found) {
-              await this.store.setCloudflareRecordId(slug, found.id);
-              // Re-read to get the updated record with recovered ID
-              const updated = await this.store.get(slug);
-              if (updated) {
-                recordId = updated.cloudflareRecordId;
-              }
-            }
-          }
-
-          if (recordId) {
-            const current = (await this.store.get(slug))!;
-            await this.dns.deleteRecord(current, hostname);
-          }
-        } catch (err) {
-          const sanitized = err instanceof RouteManagerError
-            ? err
-            : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
-          await this.store.recordError(slug, { code: sanitized.code, message: sanitized.message });
-          throw err;
-        }
-      }
+      await this.performDnsCleanup(slug);
 
       await this.store.remove(slug);
       return { slug, removed: true };
@@ -268,16 +263,16 @@ export class RouteService {
       if (now - row.updatedAt.getTime() < jitteredDelay) continue;
 
       if (row.status === 'creating') {
-        // Only retry retryable errors; fresh (no-error) rows are always processed
-        if (row.lastErrorCode !== null &&
-            row.lastErrorCode !== 'DNS_UNAVAILABLE' &&
-            row.lastErrorCode !== 'PORT_UNREACHABLE') {
-          continue;
-        }
-
         await this.slugLock.run(row.slug, async () => {
+          // Re-read and re-evaluate status, retryability, backoff
           const current = await this.store.get(row.slug);
           if (!current || current.status !== 'creating') return;
+
+          // Re-evaluate retryability from fresh row
+          if (current.lastErrorCode !== null &&
+              !RETRYABLE_CODES.has(current.lastErrorCode)) {
+            return; // Non-retryable — skip
+          }
 
           const reachable = await this.probe(
             this.config.upstreamHost,
@@ -311,26 +306,71 @@ export class RouteService {
           await this.store.activate(current.slug, recordId);
         });
       } else if (row.status === 'deleting') {
-        // Deleting rows always try cleanup
         await this.slugLock.run(row.slug, async () => {
+          // Re-read and re-evaluate status, retryability, backoff
           const current = await this.store.get(row.slug);
           if (!current || current.status !== 'deleting') return;
 
-          if (this.dns && current.cloudflareRecordId) {
-            try {
-              const hostname = `${current.slug}.${this.config.publicDomain}`;
-              await this.dns.deleteRecord(current, hostname);
-            } catch (err) {
-              const sanitized = err instanceof RouteManagerError
-                ? err
-                : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
-              await this.store.recordError(current.slug, { code: sanitized.code, message: sanitized.message });
-              return;
-            }
+          // Same retryability gate as creating — only auto-retry retryable errors
+          if (current.lastErrorCode !== null &&
+              !RETRYABLE_CODES.has(current.lastErrorCode)) {
+            return; // Non-retryable — skip
           }
+
+          await this.performDnsCleanup(current.slug);
 
           await this.store.remove(current.slug);
         });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Clean up DNS (with missing-ID recovery) for a row that is already
+   * in a terminal-transition state (deleting). Called from both `remove()`
+   * and the deleting reconciler so behaviour is identical.
+   *
+   * Precondition: caller holds the slug lock.
+   * Postcondition on success: DNS record is deleted (or confirmed absent).
+   * Postcondition on throw: error is persisted on the row; caller should
+   *   NOT remove the row.
+   */
+  private async performDnsCleanup(slug: string): Promise<void> {
+    if (!this.dns) return;
+
+    const hostname = `${slug}.${this.config.publicDomain}`;
+    const route = await this.store.get(slug);
+    if (!route) return;
+
+    let recordId = route.cloudflareRecordId;
+
+    // Recover missing Cloudflare record ID
+    if (!recordId) {
+      const found = await this.dns.findOwnedRecord(hostname, slug);
+      if (found) {
+        await this.store.setCloudflareRecordId(slug, found.id);
+        // Re-read to get the updated record with recovered ID
+        const updated = await this.store.get(slug);
+        if (updated) {
+          recordId = updated.cloudflareRecordId;
+        }
+      }
+    }
+
+    if (recordId) {
+      try {
+        const current = (await this.store.get(slug))!;
+        await this.dns.deleteRecord(current, hostname);
+      } catch (err) {
+        const sanitized = err instanceof RouteManagerError
+          ? err
+          : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
+        await this.store.recordError(slug, { code: sanitized.code, message: sanitized.message });
+        throw err;
       }
     }
   }

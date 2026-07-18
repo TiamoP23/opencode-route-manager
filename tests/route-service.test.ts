@@ -8,44 +8,88 @@ import { RouteManagerError } from '../src/errors.js';
 import { RouteService } from '../src/route-service.js';
 
 // ---------------------------------------------------------------------------
-// Fakes
+// Shared event log — single timeline emitted by every fake
 // ---------------------------------------------------------------------------
 
-type CallEntry = { method: string; args: unknown[] };
+class SharedEventLog {
+  entries: { source: string; method: string; args: unknown[] }[] = [];
+
+  add(source: string, method: string, ...args: unknown[]): void {
+    this.entries.push({ source, method, args });
+  }
+
+  clear(): void {
+    this.entries.length = 0;
+  }
+
+  /** Return method names from one source. */
+  sourceMethods(source: string): string[] {
+    return this.entries
+      .filter((e) => e.source === source)
+      .map((e) => e.method);
+  }
+
+  /** Return `source.method` strings preserving chronological order. */
+  merged(): string[] {
+    return this.entries.map((e) => `${e.source}.${e.method}`);
+  }
+
+  /** True when the ordered subsequence appears in merged(). */
+  containsSubsequence(seq: string[]): boolean {
+    const merged = this.merged();
+    let mi = 0;
+    for (const s of seq) {
+      mi = merged.indexOf(s, mi);
+      if (mi === -1) return false;
+      mi++;
+    }
+    return true;
+  }
+
+  /** Index of the first entry matching source+method, or -1 */
+  first(source: string, method: string): number {
+    return this.entries.findIndex(
+      (e) => e.source === source && e.method === method,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fakes using the shared log
+// ---------------------------------------------------------------------------
 
 class FakeRouteStore implements RouteStore {
   private data = new Map<string, RouteRecord>();
-  calls: CallEntry[] = [];
+  private log: SharedEventLog;
 
-  _reset(): void {
-    this.data.clear();
-    this.calls = [];
+  constructor(log: SharedEventLog) {
+    this.log = log;
   }
 
   async count(): Promise<number> {
-    this.calls.push({ method: 'count', args: [] });
+    this.log.add('store', 'count');
     return this.data.size;
   }
 
   async get(slug: string): Promise<RouteRecord | null> {
-    this.calls.push({ method: 'get', args: [slug] });
+    this.log.add('store', 'get', slug);
     return this.data.get(slug) ?? null;
   }
 
   async list(): Promise<RouteRecord[]> {
-    this.calls.push({ method: 'list', args: [] });
+    this.log.add('store', 'list');
     return [...this.data.values()].sort((a, b) =>
       a.slug.localeCompare(b.slug),
     );
   }
 
   async listActive(): Promise<RouteRecord[]> {
-    this.calls.push({ method: 'listActive', args: [] });
+    this.log.add('store', 'listActive');
     return [...this.data.values()].filter((r) => r.status === 'active');
   }
 
   async listPending(): Promise<RouteRecord[]> {
-    this.calls.push({ method: 'listPending', args: [] });
+    this.log.add('store', 'listPending');
     return [...this.data.values()].filter(
       (r) => r.status === 'creating' || r.status === 'deleting',
     );
@@ -56,7 +100,7 @@ class FakeRouteStore implements RouteStore {
     port: number;
     description: string | null;
   }): Promise<RouteRecord> {
-    this.calls.push({ method: 'insertCreating', args: [input] });
+    this.log.add('store', 'insertCreating', input);
     if (this.data.has(input.slug)) {
       throw new RouteManagerError(
         'ROUTE_ALREADY_EXISTS',
@@ -80,11 +124,8 @@ class FakeRouteStore implements RouteStore {
     return { ...record };
   }
 
-  async activate(
-    slug: string,
-    recordId: string | null,
-  ): Promise<RouteRecord> {
-    this.calls.push({ method: 'activate', args: [slug, recordId] });
+  async activate(slug: string, recordId: string | null): Promise<RouteRecord> {
+    this.log.add('store', 'activate', slug, recordId);
     const r = this.data.get(slug);
     if (!r) throw new RouteManagerError('ROUTE_NOT_FOUND', 'not found');
     r.status = 'active';
@@ -100,7 +141,7 @@ class FakeRouteStore implements RouteStore {
     slug: string,
     patch: { port?: number; description?: string | null },
   ): Promise<RouteRecord> {
-    this.calls.push({ method: 'updateActive', args: [slug, patch] });
+    this.log.add('store', 'updateActive', slug, patch);
     const r = this.data.get(slug);
     if (!r || r.status !== 'active')
       throw new RouteManagerError('ROUTE_NOT_FOUND', 'not found');
@@ -114,7 +155,7 @@ class FakeRouteStore implements RouteStore {
   }
 
   async markDeleting(slug: string): Promise<RouteRecord> {
-    this.calls.push({ method: 'markDeleting', args: [slug] });
+    this.log.add('store', 'markDeleting', slug);
     const r = this.data.get(slug);
     if (!r) throw new RouteManagerError('ROUTE_NOT_FOUND', 'not found');
     r.status = 'deleting';
@@ -122,14 +163,8 @@ class FakeRouteStore implements RouteStore {
     return { ...r };
   }
 
-  async setCloudflareRecordId(
-    slug: string,
-    recordId: string,
-  ): Promise<RouteRecord> {
-    this.calls.push({
-      method: 'setCloudflareRecordId',
-      args: [slug, recordId],
-    });
+  async setCloudflareRecordId(slug: string, recordId: string): Promise<RouteRecord> {
+    this.log.add('store', 'setCloudflareRecordId', slug, recordId);
     const r = this.data.get(slug);
     if (!r) throw new RouteManagerError('ROUTE_NOT_FOUND', 'not found');
     r.cloudflareRecordId = recordId;
@@ -137,11 +172,8 @@ class FakeRouteStore implements RouteStore {
     return { ...r };
   }
 
-  async recordError(
-    slug: string,
-    error: { code: string; message: string },
-  ): Promise<void> {
-    this.calls.push({ method: 'recordError', args: [slug, error] });
+  async recordError(slug: string, error: { code: string; message: string }): Promise<void> {
+    this.log.add('store', 'recordError', slug, error);
     const r = this.data.get(slug);
     if (!r) throw new RouteManagerError('ROUTE_NOT_FOUND', 'not found');
     r.lastErrorCode = error.code;
@@ -151,25 +183,26 @@ class FakeRouteStore implements RouteStore {
   }
 
   async remove(slug: string): Promise<void> {
-    this.calls.push({ method: 'remove', args: [slug] });
+    this.log.add('store', 'remove', slug);
     this.data.delete(slug);
   }
 
   async ping(): Promise<boolean> {
     return true;
   }
+
+  /** Expose internal state for tests that need to manipulate rows. */
+  _rawData(): Map<string, RouteRecord> {
+    return this.data;
+  }
 }
 
 class FakeDnsManager implements DnsManager {
-  calls: CallEntry[] = [];
-  private records = new Map<
-    string,
-    { slug: string; id: string }
-  >();
+  private log: SharedEventLog;
+  private records = new Map<string, { slug: string; id: string }>();
 
-  _reset(): void {
-    this.records.clear();
-    this.calls = [];
+  constructor(log: SharedEventLog) {
+    this.log = log;
   }
 
   _addRecord(hostname: string, slug: string, id: string): void {
@@ -180,22 +213,16 @@ class FakeDnsManager implements DnsManager {
     this.records.delete(hostname);
   }
 
-  async assertAvailable(
-    hostname: string,
-    slug: string,
-  ): Promise<void> {
-    this.calls.push({ method: 'assertAvailable', args: [hostname, slug] });
+  async assertAvailable(hostname: string, slug: string): Promise<void> {
+    this.log.add('dns', 'assertAvailable', hostname, slug);
     const existing = this.records.get(hostname);
     if (existing && existing.slug !== slug) {
       throw new RouteManagerError('DNS_CONFLICT', 'hostname taken');
     }
   }
 
-  async findOwnedRecord(
-    hostname: string,
-    slug: string,
-  ): Promise<OwnedDnsRecord | null> {
-    this.calls.push({ method: 'findOwnedRecord', args: [hostname, slug] });
+  async findOwnedRecord(hostname: string, slug: string): Promise<OwnedDnsRecord | null> {
+    this.log.add('dns', 'findOwnedRecord', hostname, slug);
     const existing = this.records.get(hostname);
     if (existing && existing.slug === slug) {
       return { id: existing.id };
@@ -203,11 +230,8 @@ class FakeDnsManager implements DnsManager {
     return null;
   }
 
-  async ensureRecord(
-    hostname: string,
-    slug: string,
-  ): Promise<OwnedDnsRecord> {
-    this.calls.push({ method: 'ensureRecord', args: [hostname, slug] });
+  async ensureRecord(hostname: string, slug: string): Promise<OwnedDnsRecord> {
+    this.log.add('dns', 'ensureRecord', hostname, slug);
     const existing = this.records.get(hostname);
     if (existing) {
       if (existing.slug === slug) return { id: existing.id };
@@ -218,23 +242,14 @@ class FakeDnsManager implements DnsManager {
     return { id };
   }
 
-  async deleteRecord(
-    route: RouteRecord,
-    hostname: string,
-  ): Promise<void> {
-    this.calls.push({ method: 'deleteRecord', args: [route, hostname] });
+  async deleteRecord(route: RouteRecord, hostname: string): Promise<void> {
+    this.log.add('dns', 'deleteRecord', route, hostname);
     if (!route.cloudflareRecordId) {
-      throw new RouteManagerError(
-        'INTERNAL_ERROR',
-        'No Cloudflare record ID to delete',
-      );
+      throw new RouteManagerError('INTERNAL_ERROR', 'No Cloudflare record ID to delete');
     }
     const existing = this.records.get(hostname);
     if (!existing || existing.id !== route.cloudflareRecordId) {
-      throw new RouteManagerError(
-        'OWNERSHIP_MISMATCH',
-        'ownership mismatch',
-      );
+      throw new RouteManagerError('OWNERSHIP_MISMATCH', 'ownership mismatch');
     }
     this.records.delete(hostname);
   }
@@ -272,26 +287,32 @@ function config(overrides?: Partial<AppConfig>): AppConfig {
   return { ...BASE_CONFIG, ...overrides };
 }
 
-const okProbe: PortProbe = async () => true;
-const failProbe: PortProbe = async () => false;
+function loggedProbe(result: boolean, log: SharedEventLog): PortProbe {
+  return async (host: string, port: number, timeoutMs: number) => {
+    log.add('probe', 'probe', host, port, timeoutMs);
+    return result;
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe('RouteService', () => {
+  let log: SharedEventLog;
   let store: FakeRouteStore;
   let dns: FakeDnsManager;
   let svc: RouteService;
 
   beforeEach(() => {
-    store = new FakeRouteStore();
-    dns = new FakeDnsManager();
+    log = new SharedEventLog();
+    store = new FakeRouteStore(log);
+    dns = new FakeDnsManager(log);
     svc = new RouteService({
       config: config(),
       store,
       dns,
-      probe: okProbe,
+      probe: loggedProbe(true, log),
     });
   });
 
@@ -303,16 +324,14 @@ describe('RouteService', () => {
       await expect(
         svc.publish({ slug: 'INVALID', port: 3000 }),
       ).rejects.toThrow(RouteManagerError);
-      expect(store.calls.length).toBe(0);
-      expect(dns.calls.length).toBe(0);
+      expect(log.entries.length).toBe(0);
     });
 
     it('validates port before any side effects', async () => {
       await expect(
         svc.publish({ slug: 'valid', port: 1 }),
       ).rejects.toThrow(RouteManagerError);
-      expect(store.calls.length).toBe(0);
-      expect(dns.calls.length).toBe(0);
+      expect(log.entries.length).toBe(0);
     });
 
     it('validates description length (max 200)', async () => {
@@ -320,91 +339,104 @@ describe('RouteService', () => {
       await expect(
         svc.publish({ slug: 'valid', port: 3000, description: longDesc }),
       ).rejects.toThrow(RouteManagerError);
-      expect(store.calls.length).toBe(0);
+      expect(log.entries.length).toBe(0);
     });
 
-    it('insertCreating then activate with Cloudflare flow', async () => {
-      const result = await svc.publish({
+    it('validates description type: null and undefined accepted, string | null | undefined', async () => {
+      // null description
+      const r1 = await svc.publish({ slug: 'desc-null', port: 3000, description: null });
+      expect(r1.description).toBeNull();
+
+      // undefined description (omitted)
+      const r2 = await svc.publish({ slug: 'desc-undef', port: 3001 });
+      expect(r2.description).toBeNull();
+    });
+
+    it('full event order with Cloudflare', async () => {
+      await svc.publish({
         slug: 'my-app',
         port: 5173,
         description: 'My App',
       });
 
-      expect(result.slug).toBe('my-app');
-      expect(result.port).toBe(5173);
-      expect(result.status).toBe('active');
-      expect(result.description).toBe('My App');
-      expect(result.cloudflareRecordId).toBeTruthy();
+      const merged = log.merged();
+      // Key events in order (store.get, store.count early, probe,
+      // dns.assertAvailable, store.count re-count, store.insertCreating,
+      // dns.ensureRecord, store.setCloudflareRecordId, store.activate)
+      const seq = [
+        'store.get',
+        'store.count',
+        'probe.probe',
+        'dns.assertAvailable',
+        'store.count',
+        'store.insertCreating',
+        'dns.ensureRecord',
+        'store.setCloudflareRecordId',
+        'store.activate',
+      ];
+      expect(merged).toEqual(expect.arrayContaining(seq));
+      expect(log.containsSubsequence(seq)).toBe(true);
 
-      // durable mutation order: insertCreating, setCloudflareRecordId, activate
-      const mutMethods = store.calls
-        .filter((c) =>
-          [
-            'insertCreating',
-            'setCloudflareRecordId',
-            'activate',
-            'recordError',
-          ].includes(c.method),
-        )
-        .map((c) => c.method);
-      expect(mutMethods).toEqual([
-        'insertCreating',
-        'setCloudflareRecordId',
-        'activate',
-      ]);
+      // store.count appears twice (early + re-count)
+      const countEntries = merged.filter((m) => m === 'store.count');
+      expect(countEntries.length).toBe(2);
+
+      // Early count precedes probe; re-count precedes insertCreating
+      const firstCount = merged.indexOf('store.count');
+      const secondCount = merged.lastIndexOf('store.count');
+      const probeIdx = merged.indexOf('probe.probe');
+      const insertIdx = merged.indexOf('store.insertCreating');
+      expect(firstCount).toBeLessThan(probeIdx);
+      expect(secondCount).toBeGreaterThan(probeIdx);
+      expect(secondCount).toBeLessThan(insertIdx);
     });
 
-    it('publish without Cloudflare: insertCreating then activate(null)', async () => {
+    it('publish without Cloudflare: store.get count probe count insertCreating activate', async () => {
       const nd = new RouteService({
         config: config({ cloudflare: null }),
         store,
         dns: null,
-        probe: okProbe,
+        probe: loggedProbe(true, log),
       });
 
-      const result = await nd.publish({ slug: 'no-dns', port: 5173 });
-      expect(result.status).toBe('active');
-      expect(result.cloudflareRecordId).toBeNull();
+      await nd.publish({ slug: 'no-dns', port: 5173 });
 
-      const mutMethods = store.calls
-        .filter((c) =>
-          [
-            'insertCreating',
-            'setCloudflareRecordId',
-            'activate',
-            'recordError',
-          ].includes(c.method),
-        )
-        .map((c) => c.method);
-      expect(mutMethods).toEqual(['insertCreating', 'activate']);
+      const merged = log.merged();
+      const seq = [
+        'store.get',
+        'store.count',
+        'probe.probe',
+        'store.count',
+        'store.insertCreating',
+        'store.activate',
+      ];
+      expect(log.containsSubsequence(seq)).toBe(true);
+      // No DNS entries
+      expect(log.sourceMethods('dns').length).toBe(0);
     });
 
-    it('probe failure: no store or DNS mutation', async () => {
-      // The probe runs inside the slug lock after re-reading via store.get().
-      // A get() call is expected but NO mutation calls.
+    it('probe failure: no store mutations and no DNS calls', async () => {
       const bad = new RouteService({
         config: config(),
         store,
         dns,
-        probe: failProbe,
+        probe: loggedProbe(false, log),
       });
 
       await expect(
         bad.publish({ slug: 'unreachable', port: 5173 }),
       ).rejects.toThrow(RouteManagerError);
 
-      const mutMethods = new Set([
-        'insertCreating', 'setCloudflareRecordId', 'activate',
-        'markDeleting', 'recordError', 'remove', 'updateActive',
-      ]);
-      const mutations = store.calls.filter((c) => mutMethods.has(c.method));
-      expect(mutations.length).toBe(0);
-      expect(dns.calls.length).toBe(0);
+      // store.get is expected (re-read under slug lock), but no mutations
+      const storeMuts = log.sourceMethods('store').filter(
+        (m) => m !== 'get' && m !== 'count',
+      );
+      expect(storeMuts.length).toBe(0);
+      expect(log.sourceMethods('dns').length).toBe(0);
     });
 
     it('DNS create failure: row stays creating, error persisted', async () => {
       // make ensureRecord throw
-      const origEnsure = dns.ensureRecord.bind(dns);
       dns.ensureRecord = async () => {
         throw new RouteManagerError('DNS_UNAVAILABLE', 'dns is down');
       };
@@ -437,7 +469,7 @@ describe('RouteService', () => {
         config: capCfg,
         store,
         dns: null,
-        probe: okProbe,
+        probe: loggedProbe(true, log),
       });
 
       await cap.publish({ slug: 'filler', port: 3000 });
@@ -447,37 +479,43 @@ describe('RouteService', () => {
         cap.publish({ slug: 'race-b', port: 8081 }),
       ]);
 
-      const succeeded = results.filter(
-        (r) => r.status === 'fulfilled',
-      );
+      const succeeded = results.filter((r) => r.status === 'fulfilled');
       const failed = results.filter((r) => r.status === 'rejected');
 
       expect(succeeded.length).toBe(1);
       expect(failed.length).toBe(1);
-      expect(
-        (failed[0] as PromiseRejectedResult).reason,
-      ).toBeInstanceOf(RouteManagerError);
-      expect(
-        (failed[0] as PromiseRejectedResult).reason.code,
-      ).toBe('ROUTE_LIMIT_REACHED');
+      expect((failed[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+        RouteManagerError,
+      );
+      expect((failed[0] as PromiseRejectedResult).reason.code).toBe(
+        'ROUTE_LIMIT_REACHED',
+      );
 
       const all = await store.list();
       expect(all.length).toBe(2);
     });
 
-    it('publish supports null and empty description', async () => {
-      const r1 = await svc.publish({
-        slug: 'null-desc',
-        port: 3000,
-        description: null,
+    it('early capacity check avoids probe/DNS when already at limit', async () => {
+      const capCfg = config({ maxRoutes: 1 });
+      const cap = new RouteService({
+        config: capCfg,
+        store,
+        dns,
+        probe: loggedProbe(true, log),
       });
-      expect(r1.description).toBeNull();
 
-      const r2 = await svc.publish({
-        slug: 'undef-desc',
-        port: 3001,
-      });
-      expect(r2.description).toBeNull();
+      await cap.publish({ slug: 'filler', port: 3000 });
+      log.clear();
+
+      await expect(
+        cap.publish({ slug: 'overflow', port: 8080 }),
+      ).rejects.toThrow(RouteManagerError);
+
+      // Should fail at early count — no probe, no DNS calls
+      const merged = log.merged();
+      expect(merged).toContain('store.count');
+      expect(merged).not.toContain('probe.probe');
+      expect(merged).not.toContain('dns.assertAvailable');
     });
   });
 
@@ -485,25 +523,66 @@ describe('RouteService', () => {
   // update
   // ----------------------------------------------------------------
   describe('update', () => {
+    it('validates slug before any side effects', async () => {
+      await expect(
+        svc.update({ slug: 'INVALID', port: 3000 }),
+      ).rejects.toThrow(RouteManagerError);
+      expect(log.entries.length).toBe(0);
+    });
+
+    it('validates port with configured policy before store/probe', async () => {
+      await svc.publish({ slug: 'upd', port: 3000 });
+      log.clear();
+
+      // denied port — should fail before probe
+      await expect(
+        svc.update({ slug: 'upd', port: 4096 }),
+      ).rejects.toThrow(RouteManagerError);
+
+      const merged = log.merged();
+      // No probe call should have happened because validatePort should
+      // reject the denied port first
+      expect(merged).not.toContain('probe.probe');
+      // Route should still have original port
+      const row = await store.get('upd');
+      expect(row!.port).toBe(3000);
+    });
+
+    it('validates description as string | null | undefined, max 200', async () => {
+      await svc.publish({ slug: 'desc-upd', port: 3000, description: 'orig' });
+
+      // null clears
+      await svc.update({ slug: 'desc-upd', description: null });
+      expect((await store.get('desc-upd'))!.description).toBeNull();
+
+      // string sets
+      await svc.update({ slug: 'desc-upd', description: 'new desc' });
+      expect((await store.get('desc-upd'))!.description).toBe('new desc');
+
+      // too long
+      await expect(
+        svc.update({ slug: 'desc-upd', description: 'x'.repeat(201) }),
+      ).rejects.toThrow(RouteManagerError);
+    });
+
     it('probes replacement port before changing active route', async () => {
       await svc.publish({ slug: 'upd', port: 3000 });
 
-      // replace probe with a spy
-      const probeSpy = vi.fn(async (_host: string, _port: number, _timeout: number) => true);
+      const probeSpy = loggedProbe(true, log);
       const updSvc = new RouteService({
         config: config(),
         store,
         dns: null,
-        probe: probeSpy as PortProbe,
+        probe: probeSpy,
       });
 
       await updSvc.update({ slug: 'upd', port: 4000 });
 
-      expect(probeSpy).toHaveBeenCalledWith(
-        expect.any(String),
-        4000,
-        expect.any(Number),
-      );
+      const merged = log.merged();
+      const probeIdx = merged.indexOf('probe.probe');
+      const updateIdx = merged.indexOf('store.updateActive');
+      expect(probeIdx).toBeGreaterThanOrEqual(0);
+      expect(updateIdx).toBeGreaterThan(probeIdx);
 
       const row = await store.get('upd');
       expect(row!.port).toBe(4000);
@@ -528,7 +607,7 @@ describe('RouteService', () => {
         config: config(),
         store,
         dns: null,
-        probe: failProbe,
+        probe: loggedProbe(false, log),
       });
 
       await expect(
@@ -544,21 +623,25 @@ describe('RouteService', () => {
   // remove
   // ----------------------------------------------------------------
   describe('remove', () => {
+    it('validates slug before any side effects', async () => {
+      await expect(
+        svc.remove('INVALID'),
+      ).rejects.toThrow(RouteManagerError);
+      expect(log.entries.length).toBe(0);
+    });
+
     it('marks deleting before DNS deletion', async () => {
       await svc.publish({ slug: 'remove-me', port: 3000 });
-      store.calls = []; // reset tracking
+      log.clear();
 
       await svc.remove('remove-me');
 
-      const markIdx = store.calls.findIndex(
-        (c) => c.method === 'markDeleting',
-      );
-      const dnsDelIdx = dns.calls.findIndex(
-        (c) => c.method === 'deleteRecord',
-      );
+      const merged = log.merged();
+      const markIdx = merged.indexOf('store.markDeleting');
+      const delIdx = merged.indexOf('dns.deleteRecord');
       expect(markIdx).toBeGreaterThanOrEqual(0);
-      expect(dnsDelIdx).toBeGreaterThanOrEqual(0);
-      expect(markIdx).toBeLessThan(dnsDelIdx);
+      expect(delIdx).toBeGreaterThanOrEqual(0);
+      expect(markIdx).toBeLessThan(delIdx);
       expect(await store.get('remove-me')).toBeNull();
     });
 
@@ -567,14 +650,15 @@ describe('RouteService', () => {
         config: config({ cloudflare: null }),
         store,
         dns: null,
-        probe: okProbe,
+        probe: loggedProbe(true, log),
       });
       await nd.publish({ slug: 'no-cf-rm', port: 3000 });
-      store.calls = [];
+      log.clear();
 
       const result = await nd.remove('no-cf-rm');
       expect(result).toEqual({ slug: 'no-cf-rm', removed: true });
       expect(await store.get('no-cf-rm')).toBeNull();
+      expect(log.sourceMethods('dns').length).toBe(0);
     });
 
     it('removes absent route successfully', async () => {
@@ -583,71 +667,28 @@ describe('RouteService', () => {
     });
 
     it('recovers cloudflareRecordId via findOwnedRecord when missing', async () => {
-      // set up a creating row without cloudflareRecordId but DNS record exists
-      const row = await store.insertCreating({
+      await store.insertCreating({
         slug: 'recover',
         port: 3000,
         description: null,
       });
-      expect(row.cloudflareRecordId).toBeNull();
       dns._addRecord('recover.tiamop23.de', 'recover', 'cf-42');
 
       const result = await svc.remove('recover');
       expect(result.removed).toBe(true);
 
-      // Must have found and then deleted the DNS record
-      expect(
-        dns.calls.some((c) => c.method === 'findOwnedRecord'),
-      ).toBe(true);
-      expect(
-        dns.calls.some((c) => c.method === 'deleteRecord'),
-      ).toBe(true);
+      const merged = log.merged();
+      expect(merged).toContain('dns.findOwnedRecord');
+      expect(merged).toContain('dns.deleteRecord');
+      // setCloudflareRecordId must happen before deleteRecord
+      expect(log.containsSubsequence([
+        'store.setCloudflareRecordId',
+        'dns.deleteRecord',
+      ])).toBe(true);
       expect(await store.get('recover')).toBeNull();
     });
 
-    it('recovers and removes when findOwnedRecord finds record', async () => {
-      // Build a merged timeline to verify setCloudflareRecordId happens
-      // before deleteRecord.
-      await store.insertCreating({
-        slug: 'recover-mid',
-        port: 3000,
-        description: null,
-      });
-      dns._addRecord(
-        'recover-mid.tiamop23.de',
-        'recover-mid',
-        'cf-99',
-      );
-
-      await svc.remove('recover-mid');
-
-      const merged: { source: string; method: string; ts: number }[] = [];
-
-      // The _reset() method didn't zero ts, but each call is captured at
-      // call-observation time. We use the array index as a proxy for order
-      // by merging the calls into a single timeline.
-      for (let i = 0; i < store.calls.length; i++) {
-        merged.push({ source: 'store', method: store.calls[i]!.method, ts: i });
-      }
-      for (let i = 0; i < dns.calls.length; i++) {
-        merged.push({ source: 'dns', method: dns.calls[i]!.method, ts: i + store.calls.length });
-      }
-      merged.sort((a, b) => a.ts - b.ts);
-
-      const setIdEntry = merged.find(
-        (e) => e.source === 'store' && e.method === 'setCloudflareRecordId',
-      );
-      const delEntry = merged.find(
-        (e) => e.source === 'dns' && e.method === 'deleteRecord',
-      );
-
-      expect(setIdEntry).toBeDefined();
-      expect(delEntry).toBeDefined();
-      expect(setIdEntry!.ts).toBeLessThan(delEntry!.ts);
-    });
-
     it('removes local row when findOwnedRecord returns null', async () => {
-      // route exists but no DNS record
       await store.insertCreating({
         slug: 'no-dns-rec',
         port: 3000,
@@ -656,28 +697,19 @@ describe('RouteService', () => {
 
       await svc.remove('no-dns-rec');
 
-      expect(
-        dns.calls.some((c) => c.method === 'findOwnedRecord'),
-      ).toBe(true);
-      // deleteRecord should NOT be called
-      expect(
-        dns.calls.some((c) => c.method === 'deleteRecord'),
-      ).toBe(false);
+      expect(log.merged()).toContain('dns.findOwnedRecord');
+      expect(log.merged()).not.toContain('dns.deleteRecord');
       expect(await store.get('no-dns-rec')).toBeNull();
     });
 
     it('DNS failure during remove: row stays deleting, projection excludes it', async () => {
       await svc.publish({ slug: 'del-fail', port: 3000 });
 
-      // Make deleteRecord throw
-      const origDelete = dns.deleteRecord.bind(dns);
       dns.deleteRecord = async () => {
         throw new RouteManagerError('DNS_UNAVAILABLE', 'dns down');
       };
 
-      await expect(
-        svc.remove('del-fail'),
-      ).rejects.toThrow(RouteManagerError);
+      await expect(svc.remove('del-fail')).rejects.toThrow(RouteManagerError);
 
       const row = await store.get('del-fail');
       expect(row).not.toBeNull();
@@ -686,6 +718,38 @@ describe('RouteService', () => {
       // activeTraefikDocument must exclude deleting rows
       const doc = await svc.activeTraefikDocument();
       expect(doc.http.routers['agent-del-fail']).toBeUndefined();
+    });
+
+    it('full event order for remove with Cloudflare', async () => {
+      await svc.publish({ slug: 'order-rm', port: 3000 });
+      log.clear();
+
+      await svc.remove('order-rm');
+
+      const seq = [
+        'store.get',
+        'store.markDeleting',
+        'dns.deleteRecord',
+        'store.remove',
+      ];
+      expect(log.containsSubsequence(seq)).toBe(true);
+    });
+
+    it('full event order for remove with missing-id recovery', async () => {
+      await store.insertCreating({ slug: 'order-rec', port: 3000, description: null });
+      dns._addRecord('order-rec.tiamop23.de', 'order-rec', 'cf-rec99');
+
+      await svc.remove('order-rec');
+
+      const seq = [
+        'store.get',
+        'store.markDeleting',
+        'dns.findOwnedRecord',
+        'store.setCloudflareRecordId',
+        'dns.deleteRecord',
+        'store.remove',
+      ];
+      expect(log.containsSubsequence(seq)).toBe(true);
     });
   });
 
@@ -707,14 +771,10 @@ describe('RouteService', () => {
       const doc = await svc.activeTraefikDocument();
       const router = doc.http.routers['agent-for-doc'];
       expect(router).toBeDefined();
-      expect(router!.rule).toContain(
-        'for-doc.tiamop23.de',
-      );
+      expect(router!.rule).toContain('for-doc.tiamop23.de');
 
       // Verify store.listActive was called
-      expect(
-        store.calls.some((c) => c.method === 'listActive'),
-      ).toBe(true);
+      expect(log.sourceMethods('store')).toContain('listActive');
     });
   });
 
@@ -723,15 +783,12 @@ describe('RouteService', () => {
   // ----------------------------------------------------------------
   describe('slug-level concurrency lock (KeyedLock)', () => {
     it('same-slug concurrent publishes are serialized (at most one creating row)', async () => {
-      // Both slugs are the same — lock should serialize
       const results = await Promise.allSettled([
         svc.publish({ slug: 'same', port: 3000 }),
         svc.publish({ slug: 'same', port: 3001 }),
       ]);
 
-      const succeeded = results.filter(
-        (r) => r.status === 'fulfilled',
-      );
+      const succeeded = results.filter((r) => r.status === 'fulfilled');
       expect(succeeded.length).toBe(1); // second is ROUTE_ALREADY_EXISTS
     });
 
@@ -741,9 +798,7 @@ describe('RouteService', () => {
         svc.publish({ slug: 'beta', port: 3001 }),
       ]);
 
-      const succeeded = results.filter(
-        (r) => r.status === 'fulfilled',
-      );
+      const succeeded = results.filter((r) => r.status === 'fulfilled');
       expect(succeeded.length).toBe(2);
     });
   });
@@ -758,20 +813,10 @@ describe('RouteService', () => {
 
     it('reconcile creating: re-probe, ensure DNS, store ID, activate', async () => {
       vi.useFakeTimers();
-
-      // Create a creating row (simulating a previous publish that got stuck)
-      const rec = await store.insertCreating({
-        slug: 'recreate',
-        port: 3000,
-        description: 'to recover',
-      });
-      expect(rec.status).toBe('creating');
-
-      // reconciler should adopt the DNS record
+      await store.insertCreating({ slug: 'recreate', port: 3000, description: 'to recover' });
       dns._addRecord('recreate.tiamop23.de', 'recreate', 'cf-adopt');
-
-      // Advance time past the backoff for retryCount=0 (1s + 20% jitter max = 1.2s)
       vi.advanceTimersByTime(2000);
+      log.clear();
 
       await svc.reconcilePending();
 
@@ -780,67 +825,46 @@ describe('RouteService', () => {
       expect(row!.status).toBe('active');
       expect(row!.cloudflareRecordId).toBe('cf-adopt');
 
-      // Must have ensured DNS was adopted
-      expect(
-        dns.calls.some((c) => c.method === 'ensureRecord'),
-      ).toBe(true);
+      const seq = [
+        'store.listPending',
+        'probe.probe',
+        'dns.ensureRecord',
+        'store.setCloudflareRecordId',
+        'store.activate',
+      ];
+      expect(log.containsSubsequence(seq)).toBe(true);
     });
 
     it('reconcile deleting: delete DNS then remove row', async () => {
       vi.useFakeTimers();
-
-      // Create and activate, then directly mark as deleting
-      await store.insertCreating({
-        slug: 'recon-del',
-        port: 3000,
-        description: null,
-      });
+      await store.insertCreating({ slug: 'recon-del', port: 3000, description: null });
       await store.activate('recon-del', 'cf-del-1');
-      // Manually create DNS record
-      dns._addRecord(
-        'recon-del.tiamop23.de',
-        'recon-del',
-        'cf-del-1',
-      );
-      // Mark deleting in store, bypassing service
+      dns._addRecord('recon-del.tiamop23.de', 'recon-del', 'cf-del-1');
       await store.markDeleting('recon-del');
-
-      // Advance time past the backoff
       vi.advanceTimersByTime(2000);
+      log.clear();
 
       await svc.reconcilePending();
 
-      // Row should be gone
       expect(await store.get('recon-del')).toBeNull();
-      // DNS should have been deleted
-      expect(
-        dns.calls.some((c) => c.method === 'deleteRecord'),
-      ).toBe(true);
+
+      const seq = ['store.listPending', 'dns.deleteRecord', 'store.remove'];
+      expect(log.containsSubsequence(seq)).toBe(true);
     });
 
     it('reconcile creating re-probes and does not activate when port unreachable', async () => {
       vi.useFakeTimers();
-
       const badProber = new RouteService({
         config: config(),
         store,
         dns,
-        probe: failProbe,
+        probe: loggedProbe(false, log),
       });
 
-      await store.insertCreating({
-        slug: 'unreach-recon',
-        port: 3000,
-        description: null,
-      });
-      dns._addRecord(
-        'unreach-recon.tiamop23.de',
-        'unreach-recon',
-        'cf-unreach',
-      );
-
-      // Advance time past the backoff
+      await store.insertCreating({ slug: 'unreach-recon', port: 3000, description: null });
+      dns._addRecord('unreach-recon.tiamop23.de', 'unreach-recon', 'cf-unreach');
       vi.advanceTimersByTime(2000);
+      log.clear();
 
       await badProber.reconcilePending();
 
@@ -852,51 +876,33 @@ describe('RouteService', () => {
 
     it('reconcile deleting does not call probe', async () => {
       vi.useFakeTimers();
-
-      // We need a probe that fails, but deleting should never call it
       const badProber = new RouteService({
         config: config(),
         store,
         dns,
-        probe: failProbe,
+        probe: loggedProbe(false, log),
       });
 
-      await store.insertCreating({
-        slug: 'del-no-probe',
-        port: 3000,
-        description: null,
-      });
+      await store.insertCreating({ slug: 'del-no-probe', port: 3000, description: null });
       await store.activate('del-no-probe', 'cf-del-2');
-      dns._addRecord(
-        'del-no-probe.tiamop23.de',
-        'del-no-probe',
-        'cf-del-2',
-      );
+      dns._addRecord('del-no-probe.tiamop23.de', 'del-no-probe', 'cf-del-2');
       await store.markDeleting('del-no-probe');
-
-      // Advance time past the backoff
       vi.advanceTimersByTime(2000);
+      log.clear();
 
       await badProber.reconcilePending();
 
-      // Should still succeed because deleting path doesn't probe
       expect(await store.get('del-no-probe')).toBeNull();
+      expect(log.sourceMethods('probe').length).toBe(0);
     });
 
     it('reconcile skips rows whose backoff is not yet due', async () => {
       vi.useFakeTimers();
+      await store.insertCreating({ slug: 'not-due', port: 3000, description: null });
+      // Do NOT advance time
 
-      // Create a row that is NOT yet due by keeping time at creation
-      await store.insertCreating({
-        slug: 'not-due',
-        port: 3000,
-        description: null,
-      });
-
-      // Do NOT advance time — the row was just created so backoff (1s) isn't due
       await svc.reconcilePending();
 
-      // Row should still be creating (not reconciled)
       const row = await store.get('not-due');
       expect(row).not.toBeNull();
       expect(row!.status).toBe('creating');
@@ -904,26 +910,93 @@ describe('RouteService', () => {
 
     it('reconcile creating retries only retryable errors', async () => {
       vi.useFakeTimers();
-
-      // Create a row with a non-retryable error
-      await store.insertCreating({
-        slug: 'non-retryable',
-        port: 3000,
-        description: null,
-      });
-      // Manually set retryCount to ensure backoff isn't a factor
+      await store.insertCreating({ slug: 'non-retryable', port: 3000, description: null });
       await store.recordError('non-retryable', { code: 'HOSTNAME_RESERVED', message: 'reserved' });
       dns._addRecord('non-retryable.tiamop23.de', 'non-retryable', 'cf-nr');
-
-      // Advance time past any backoff
       vi.advanceTimersByTime(2000);
 
       await svc.reconcilePending();
 
-      // Should NOT be activated (non-retryable error)
       const row = await store.get('non-retryable');
       expect(row).not.toBeNull();
       expect(row!.status).toBe('creating');
+    });
+
+    it('reconcile deleting with missing ID: findOwnedRecord then delete DNS and remove', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'del-rec', port: 3000, description: null });
+      await store.activate('del-rec', null); // no cloudflareRecordId stored
+      dns._addRecord('del-rec.tiamop23.de', 'del-rec', 'cf-found');
+      await store.markDeleting('del-rec');
+      vi.advanceTimersByTime(2000);
+      log.clear();
+
+      await svc.reconcilePending();
+
+      expect(await store.get('del-rec')).toBeNull();
+
+      const seq = [
+        'dns.findOwnedRecord',
+        'store.setCloudflareRecordId',
+        'dns.deleteRecord',
+        'store.remove',
+      ];
+      expect(log.containsSubsequence(seq)).toBe(true);
+    });
+
+    it('reconcile deleting with no owned record: remove local row without DNS call', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'del-no-owned', port: 3000, description: null });
+      await store.activate('del-no-owned', null);
+      // No DNS record in fake
+      await store.markDeleting('del-no-owned');
+      vi.advanceTimersByTime(2000);
+      log.clear();
+
+      await svc.reconcilePending();
+
+      expect(await store.get('del-no-owned')).toBeNull();
+      expect(log.merged()).toContain('dns.findOwnedRecord');
+      expect(log.merged()).not.toContain('dns.deleteRecord');
+    });
+
+    it('reconcile deleting with permanent error: skips auto-retry', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'del-perm', port: 3000, description: null });
+      await store.activate('del-perm', 'cf-perm');
+      dns._addRecord('del-perm.tiamop23.de', 'del-perm', 'cf-perm');
+      await store.markDeleting('del-perm');
+      // Set a permanent error
+      await store.recordError('del-perm', { code: 'OWNERSHIP_MISMATCH', message: 'not ours' });
+      vi.advanceTimersByTime(2000);
+      log.clear();
+
+      await svc.reconcilePending();
+
+      // Row should still be deleting (not removed, not retried)
+      const row = await store.get('del-perm');
+      expect(row).not.toBeNull();
+      expect(row!.status).toBe('deleting');
+      // No DNS or remove calls after slug-lock re-evaluation
+      expect(log.merged()).not.toContain('dns.deleteRecord');
+      expect(log.merged()).not.toContain('store.remove');
+    });
+
+    it('reconcile re-evaluates status after slug lock (skips already-resolved)', async () => {
+      vi.useFakeTimers();
+      await store.insertCreating({ slug: 'already-active', port: 3000, description: null });
+      vi.advanceTimersByTime(2000);
+      // Manually activate it before reconcile runs
+      await store.activate('already-active', null);
+      log.clear();
+
+      await svc.reconcilePending();
+
+      // No further mutations after activation
+      const storeMuts = log.sourceMethods('store').filter(
+        (m) => m === 'insertCreating' || m === 'activate' || m === 'remove',
+      );
+      expect(storeMuts.length).toBe(0);
     });
   });
 });
