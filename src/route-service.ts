@@ -46,6 +46,16 @@ function validateDescription(value: unknown): void {
 const RETRYABLE_CODES = new Set(['DNS_UNAVAILABLE', 'PORT_UNREACHABLE']);
 
 /**
+ * Per-row reconciliation error event emitted by `reconcilePending`.
+ * Contains only the stable identifier fields — no message, no configuration.
+ */
+export interface ReconcileErrorEvent {
+  slug: string;
+  status: 'creating' | 'deleting';
+  code: string;
+}
+
+/**
  * Orchestrates the route lifecycle:
  *
  *   validate → [global lock: count + insertCreating]
@@ -62,17 +72,21 @@ export class RouteService {
   private readonly store: RouteStore;
   private readonly dns: DnsManager | null;
   private readonly probe: PortProbe;
+  private readonly onReconcileEvent: ((event: ReconcileErrorEvent) => void) | undefined;
 
   constructor(deps: {
     config: AppConfig;
     store: RouteStore;
     dns: DnsManager | null;
     probe: PortProbe;
+    /** Optional callback fired on per-row reconciliation errors. */
+    onReconcileEvent?: (event: ReconcileErrorEvent) => void;
   }) {
     this.config = deps.config;
     this.store = deps.store;
     this.dns = deps.dns;
     this.probe = deps.probe;
+    this.onReconcileEvent = deps.onReconcileEvent;
   }
 
   // -------------------------------------------------------------------------
@@ -316,6 +330,11 @@ export class RouteService {
                 code: 'PORT_UNREACHABLE',
                 message: `port ${current.port} on ${this.config.upstreamHost} is not reachable`,
               });
+              this.onReconcileEvent?.({
+                slug: row.slug,
+                status: 'creating',
+                code: 'PORT_UNREACHABLE',
+              });
               return;
             }
 
@@ -331,6 +350,11 @@ export class RouteService {
                   ? err
                   : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
                 await this.store.recordError(current.slug, { code: sanitized.code, message: sanitized.message });
+                this.onReconcileEvent?.({
+                  slug: current.slug,
+                  status: 'creating',
+                  code: sanitized.code,
+                });
                 return;
               }
             }
@@ -358,7 +382,17 @@ export class RouteService {
               return; // Non-retryable — skip
             }
 
-            await this.performDnsCleanup(current.slug);
+            try {
+              await this.performDnsCleanup(current.slug);
+            } catch (err) {
+              const code = err instanceof RouteManagerError ? err.code : 'INTERNAL_ERROR';
+              this.onReconcileEvent?.({
+                slug: current.slug,
+                status: 'deleting',
+                code,
+              });
+              return; // leave row in deleting state for retry
+            }
 
             await this.store.remove(current.slug);
           });

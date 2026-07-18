@@ -209,21 +209,22 @@ export function createHttpApp(deps: HttpAppDeps): Express {
     // { sessionIdGenerator: undefined }.
     const transport = new StreamableHTTPServerTransport({});
 
-    // Track whether we already sent a response to avoid double-send
+    // Separate exactly-once guards: one for the 500 response, one for
+    // transport/server close.  Using two flags means cleanup is never
+    // blocked by response state or vice versa.
     let responded = false;
+    let cleanupDone = false;
 
-    // Idempotent cleanup helper
     const cleanup = (): void => {
+      if (cleanupDone) return;
+      cleanupDone = true;
       transport.close().catch(() => {});
       mcpServer.close().catch(() => {});
     };
 
-    res.on('close', () => {
-      if (!responded) {
-        responded = true;
-        cleanup();
-      }
-    });
+    // Safety net: if the response stream closes before our handler runs
+    // (connection lost), clean up immediately.
+    res.on('close', cleanup);
 
     try {
       // The SDK's StreamableHTTPServerTransport satisfies the Transport
@@ -244,10 +245,7 @@ export function createHttpApp(deps: HttpAppDeps): Express {
           });
       }
     } finally {
-      if (!responded) {
-        responded = true;
-        cleanup();
-      }
+      cleanup();
     }
   });
 

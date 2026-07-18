@@ -20,7 +20,7 @@ export function openDatabase(path: string, migrationsFolder: string): DatabaseCo
     return {
       sqlite,
       db,
-      close: () => { sqlite.close(); },
+      close: () => { try { sqlite.close(); } catch { /* already closed */ } },
     };
   } catch (e) {
     sqlite.close();

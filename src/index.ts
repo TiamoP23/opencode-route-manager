@@ -43,6 +43,10 @@ export interface TimerHandle {
   clear(): void;
 }
 
+export type DeadlineResult<T> =
+  | { success: true; value: T }
+  | { success: false; timedOut: true };
+
 /**
  * Narrowly typed runtime primitives that `startApplication` uses instead of
  * calling Node.js globals directly.  Inject a custom implementation in tests
@@ -64,6 +68,12 @@ export interface RuntimeDeps {
   onSignal(sig: string, handler: () => void): () => void;
   /** Terminate the process with `code`. */
   exit(code: number): void;
+  /**
+   * Race `promise` against a `ms` timeout.  Returns `{ success: true, value }`
+   * when the promise settles first, or `{ success: false, timedOut: true }`
+   * when the deadline fires first.  Does NOT cancel the underlying promise.
+   */
+  deadline<T>(promise: Promise<T>, ms: number): Promise<DeadlineResult<T>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +111,18 @@ const defaultRuntime: RuntimeDeps = {
   exit: (code) => {
     process.exit(code);
   },
+  deadline: async <T>(promise: Promise<T>, ms: number): Promise<DeadlineResult<T>> => {
+    const timeout = new Promise<DeadlineResult<T>>((resolve) => {
+      const id = setTimeout(() => resolve({ success: false, timedOut: true }), ms);
+      // Allow the timer to keep the event loop alive
+      if (id.unref) id.unref();
+    });
+    const winner = await Promise.race([
+      promise.then((value) => ({ success: true, value } as const)),
+      timeout,
+    ]);
+    return winner;
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -119,18 +141,24 @@ export interface StartOptions {
   env: Record<string, string | undefined>;
 }
 
+/** Default deadline for the initial reconciliation pass. */
+const INITIAL_RECONCILE_DEADLINE_MS = 10_000;
+
 // ---------------------------------------------------------------------------
 // startApplication
 // ---------------------------------------------------------------------------
 
 /**
  * Loads config, opens SQLite with migrations, constructs dependencies,
- * runs one awaitable initial reconciliation, serves HTTP, schedules
+ * runs one bounded initial reconciliation, serves HTTP, schedules
  * retryable reconciliation every 30 seconds (single-flight), and handles
  * graceful shutdown on SIGINT / SIGTERM.
  *
  * Accepts an optional second argument with overridden `RuntimeDeps` for
  * testing — when omitted real Node.js primitives are used.
+ *
+ * Signal handlers are installed BEFORE the initial reconciliation so that
+ * signals during startup own all acquired resources.
  *
  * On any startup failure all previously-acquired resources (DB, server,
  * timer) are rolled back before the error propagates.
@@ -150,8 +178,14 @@ export async function startApplication(
   let timerHandle: TimerHandle | null = null;
   let unregisterSignal: (() => void) | null = null;
 
-  // In-flight reconcile tracker for shutdown ordering
+  // In-flight reconcile tracker for single-flight scheduler + shutdown await.
+  // Set by both: timed-out initial reconcile (the running promise) and
+  // scheduled reconciles (via runScheduledReconcile).
   let currentReconcile: Promise<void> | null = null;
+
+  // Shared shutdown promise — all concurrent close/signal callers await the
+  // same settled promise.
+  let shutdownPromise: Promise<void> | null = null;
 
   try {
     // -----------------------------------------------------------------------
@@ -185,7 +219,19 @@ export async function startApplication(
     }
 
     const probe: PortProbe = probeTcpPort;
-    const service = new RouteService({ config, store, dns, probe });
+    const service = new RouteService({
+      config,
+      store,
+      dns,
+      probe,
+      onReconcileEvent: (evt) => {
+        log('reconcile_error', {
+          slug: evt.slug,
+          status: evt.status,
+          code: evt.code,
+        });
+      },
+    });
     log('service_ready');
 
     // -----------------------------------------------------------------------
@@ -196,65 +242,30 @@ export async function startApplication(
     log('http_app_created');
 
     // -----------------------------------------------------------------------
-    // Stage 5 — Initial reconciliation (await BEFORE listen)
+    // Stage 5 — Signal handlers (BEFORE initial reconcile)
     // -----------------------------------------------------------------------
-    log('initial_reconciliation');
-    await service.reconcilePending();
-    log('initial_reconciliation_done');
-
-    // -----------------------------------------------------------------------
-    // Stage 6 — Listen
-    // -----------------------------------------------------------------------
-    const assignedPort = await serverHandle.listen(
-      config.listenPort,
-      config.listenHost,
-    );
-    log('http_listening', { port: assignedPort });
-
-    // -----------------------------------------------------------------------
-    // Stage 7 — Scheduled single-flight reconciliation
-    // -----------------------------------------------------------------------
-    const runScheduledReconcile = async (): Promise<void> => {
-      if (currentReconcile !== null) return; // in-flight, skip
-      try {
-        currentReconcile = service.reconcilePending();
-        await currentReconcile;
-      } catch {
-        // Errors are logged inside reconcilePending; swallow here so the
-        // scheduler interval stays alive.
-      } finally {
-        currentReconcile = null;
-      }
-    };
-
-    timerHandle = runtime.setTimer(runScheduledReconcile, 30_000);
-    log('scheduler_started', { intervalMs: 30_000 });
-
-    // -----------------------------------------------------------------------
-    // Stage 8 — Signal handlers
-    // -----------------------------------------------------------------------
-    let shutdownCalled = false;
-    const shutdown = async (): Promise<void> => {
-      if (shutdownCalled) return;
-      shutdownCalled = true;
-      log('shutdown_initiated');
-      // 1. Stop scheduler — no new reconciles
-      timerHandle?.clear();
-      // 2. Unregister signal handler — prevent re-entrance
-      unregisterSignal?.();
-      // 3. Stop accepting HTTP and drain active connections
-      await serverHandle?.close().catch(() => {});
-      // 4. Await in-flight reconcile
-      if (currentReconcile !== null) {
-        await currentReconcile.catch(() => {});
-      }
-      // 5. Close SQLite
-      dbCtx?.close();
-      log('shutdown_complete');
+    const shutdown = (): Promise<void> => {
+      if (shutdownPromise) return shutdownPromise;
+      shutdownPromise = (async () => {
+        log('shutdown_initiated');
+        // 1. Stop scheduler — no new reconciles
+        timerHandle?.clear();
+        // 2. Unregister signal handler — prevent re-entrance
+        unregisterSignal?.();
+        // 3. Stop accepting HTTP and drain active connections
+        await serverHandle?.close().catch(() => {});
+        // 4. Await in-flight reconcile
+        if (currentReconcile !== null) {
+          await currentReconcile.catch(() => {});
+        }
+        // 5. Close SQLite
+        try { dbCtx?.close(); } catch { /* already closed */ }
+        log('shutdown_complete');
+      })();
+      return shutdownPromise;
     };
 
     const onSignal = (): void => {
-      // Fire-and-forget shutdown, then exit
       shutdown().then(
         () => runtime.exit(0),
         () => runtime.exit(1),
@@ -268,6 +279,53 @@ export async function startApplication(
       unregSigterm();
     };
     log('signal_handlers_installed');
+
+    // -----------------------------------------------------------------------
+    // Stage 6 — Initial reconciliation (bounded by deadline)
+    // -----------------------------------------------------------------------
+    log('initial_reconciliation');
+    const initialPromise = service.reconcilePending();
+    const deadlineResult = await runtime.deadline(
+      initialPromise,
+      INITIAL_RECONCILE_DEADLINE_MS,
+    );
+
+    if (!deadlineResult.success) {
+      // Timed out — the promise is still running; keep it as currentReconcile
+      // so the scheduler skips overlap and shutdown awaits it.
+      currentReconcile = initialPromise.catch(() => {});
+      log('initial_reconciliation_deadline');
+    } else {
+      log('initial_reconciliation_done');
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 7 — Listen
+    // -----------------------------------------------------------------------
+    const assignedPort = await serverHandle.listen(
+      config.listenPort,
+      config.listenHost,
+    );
+    log('http_listening', { port: assignedPort });
+
+    // -----------------------------------------------------------------------
+    // Stage 8 — Scheduled single-flight reconciliation
+    // -----------------------------------------------------------------------
+    const runScheduledReconcile = async (): Promise<void> => {
+      if (currentReconcile !== null) return; // in-flight, skip
+      try {
+        currentReconcile = service.reconcilePending();
+        await currentReconcile;
+      } catch {
+        // Scheduler-level failure — log fixed code only, no message/config
+        log('reconcile_scheduler_error');
+      } finally {
+        currentReconcile = null;
+      }
+    };
+
+    timerHandle = runtime.setTimer(runScheduledReconcile, 30_000);
+    log('scheduler_started', { intervalMs: 30_000 });
 
     // -----------------------------------------------------------------------
     // Return handle
@@ -285,7 +343,7 @@ export async function startApplication(
     timerHandle?.clear();
     if (unregisterSignal) unregisterSignal();
     await serverHandle?.close().catch(() => {});
-    dbCtx?.close();
+    try { dbCtx?.close(); } catch { /* already closed */ }
     throw err;
   }
 }

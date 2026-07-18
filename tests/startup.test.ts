@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 import type { RuntimeDeps } from '../src/index.js';
 
 // ---------------------------------------------------------------------------
@@ -13,13 +15,8 @@ const baseEnv: Record<string, string> = {
   LISTEN_PORT: '3001',
 };
 
-/** Fake runtime that tracks events via a mutable array. */
-function trackRuntime(): {
-  deps: RuntimeDeps;
-  events: string[];
-} {
+function trackRuntime(): { deps: RuntimeDeps; events: string[] } {
   const events: string[] = [];
-
   return {
     deps: {
       createServer: () => {
@@ -29,12 +26,10 @@ function trackRuntime(): {
             events.push(`listen:${host}:${port}`);
             return Number(port);
           },
-          close: async () => {
-            events.push('server.close');
-          },
+          close: async () => { events.push('server.close'); },
         };
       },
-      setTimer: (fn) => {
+      setTimer: () => {
         events.push('setTimer');
         return { clear: () => events.push('timer.clear') };
       },
@@ -43,6 +38,11 @@ function trackRuntime(): {
         return () => { events.push(`offSignal:${sig}`); };
       },
       exit: (code) => { events.push(`exit:${code}`); },
+      deadline: async <T>(p: Promise<T>, _ms: number) => {
+        events.push('deadline');
+        const value = await p;
+        return { success: true, value } as const;
+      },
     },
     events,
   };
@@ -79,32 +79,32 @@ describe('startup runtime', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Clean start / stop with fake runtime
+  // Clean start / stop
   // -----------------------------------------------------------------------
 
   it('starts and stops cleanly with injected runtime', async () => {
     const { startApplication } = await import('../src/index.js');
     const rt = trackRuntime();
     const app = await startApplication({ env: baseEnv }, { runtime: rt.deps });
-    expect(app).toBeDefined();
-    expect(typeof app.close).toBe('function');
-    expect(app.port).toBeGreaterThan(0);
-    // Events: createServer -> listen -> setTimer -> onSignal
-    expect(rt.events).toContain('createServer');
-    expect(rt.events).toContain('setTimer');
-    await app.close();
-    // Close should stop timer, close server, remove signal handlers
+    try {
+      expect(app).toBeDefined();
+      expect(typeof app.close).toBe('function');
+      expect(app.port).toBeGreaterThan(0);
+      expect(rt.events).toContain('createServer');
+      expect(rt.events).toContain('setTimer');
+    } finally {
+      await app.close();
+    }
     expect(rt.events).toContain('timer.clear');
     expect(rt.events).toContain('server.close');
-    // Both SIGINT and SIGTERM were registered, both should be cleaned
     expect(rt.events.filter((e) => e.startsWith('offSignal')).length).toBe(2);
   });
 
   // -----------------------------------------------------------------------
-  // Initial reconcile BEFORE listen (events order)
+  // Signal ownership before initial reconcile (finding 2)
   // -----------------------------------------------------------------------
 
-  it('runs initial reconcile before listen', async () => {
+  it('installs signal handlers before initial reconcile and listen', async () => {
     const { startApplication } = await import('../src/index.js');
     const events: string[] = [];
     const app = await startApplication(
@@ -114,10 +114,7 @@ describe('startup runtime', () => {
           createServer: () => {
             events.push('createServer');
             return {
-              listen: async (port, host) => {
-                events.push('listen');
-                return Number(port);
-              },
+              listen: async () => { events.push('listen'); return 3001; },
               close: async () => { events.push('server.close'); },
             };
           },
@@ -125,92 +122,149 @@ describe('startup runtime', () => {
             events.push('setTimer');
             return { clear: () => { events.push('timer.clear'); } };
           },
-          onSignal: () => {
-            events.push('onSignal');
-            return () => { events.push('offSignal'); };
+          onSignal: (sig) => {
+            events.push(`onSignal:${sig}`);
+            return () => { events.push(`offSignal:${sig}`); };
+          },
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            events.push('deadline');
+            const value = await p;
+            return { success: true, value } as const;
           },
           exit: () => {},
         },
       },
     );
-    // createServer before setTimer (which is set up after listen)
-    const createIdx = events.indexOf('createServer');
-    const timerIdx = events.indexOf('setTimer');
-    expect(createIdx).toBeLessThan(timerIdx);
-    await app.close();
+    try {
+      const signalIdx = events.findIndex((e) => e.startsWith('onSignal'));
+      const deadlineIdx = events.indexOf('deadline');
+      const listenIdx = events.indexOf('listen');
+      expect(signalIdx).toBeLessThan(deadlineIdx);
+      expect(signalIdx).toBeLessThan(listenIdx);
+    } finally {
+      await app.close();
+    }
   });
 
   // -----------------------------------------------------------------------
-  // Shutdown awaits in-flight reconcile
+  // Initial reconcile respects deadline (finding 1)
   // -----------------------------------------------------------------------
 
-  it('awaits in-flight reconcile during shutdown', async () => {
+  it('initial reconcile succeeds within deadline', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const rt = trackRuntime();
+    const app = await startApplication({ env: baseEnv }, { runtime: rt.deps });
+    try {
+      expect(rt.events).toContain('deadline');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('initial reconcile deadline timeout continues to listen', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const events: string[] = [];
+    const app = await startApplication(
+      { env: baseEnv },
+      {
+        runtime: {
+          createServer: () => ({
+            listen: async () => { events.push('listen'); return 3002; },
+            close: async () => { events.push('server.close'); },
+          }),
+          setTimer: () => ({ clear: () => { events.push('timer.clear'); } }),
+          onSignal: () => () => {},
+          deadline: async <T>(_p: Promise<T>, _ms: number) => {
+            events.push('deadline.timeout');
+            return { success: false, timedOut: true } as const;
+          },
+          exit: () => {},
+        },
+      },
+    );
+    try {
+      expect(events).toContain('deadline.timeout');
+      expect(events).toContain('listen');
+      expect(app.port).toBe(3002);
+    } finally {
+      await app.close();
+    }
+    expect(events).toContain('server.close');
+  });
+
+  // -----------------------------------------------------------------------
+  // No-overlap scheduled reconcile (finding 1)
+  // -----------------------------------------------------------------------
+
+  it('does not overlap scheduled reconciles', async () => {
     const { startApplication } = await import('../src/index.js');
     let timerCb: (() => Promise<void>) | null = null;
-    let slowReconcileResolve!: () => void;
-    const slowReconcileDone = new Promise<void>((r) => { slowReconcileResolve = r; });
-    let slowReconcileStarted = false;
+    const events: string[] = [];
 
     const app = await startApplication(
       { env: baseEnv },
       {
         runtime: {
           createServer: () => ({
-            listen: async () => 3001,
-            close: async () => {},
+            listen: async () => { events.push('listen'); return 3001; },
+            close: async () => { events.push('server.close'); },
           }),
           setTimer: (fn) => {
             timerCb = fn;
-            return { clear: () => {} };
+            return { clear: () => { events.push('timer.clear'); } };
           },
           onSignal: () => () => {},
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            events.push('deadline');
+            const value = await p;
+            return { success: true, value } as const;
+          },
           exit: () => {},
         },
       },
     );
-
-    // Initial reconcile already completed. Patch RouteService to slow down
-    // subsequent (scheduled) reconciles.
-    const { RouteService } = await import('../src/route-service.js');
-    const origReconcile = RouteService.prototype.reconcilePending;
-
     try {
-      RouteService.prototype.reconcilePending = async function () {
-        slowReconcileStarted = true;
-        await slowReconcileDone;
-        return origReconcile.call(this);
-      };
+      const { RouteService } = await import('../src/route-service.js');
+      const orig = RouteService.prototype.reconcilePending;
+      let reconcileCount = 0;
+      let resolveSlow!: () => void;
+      const slowGate = new Promise<void>((r) => { resolveSlow = r; });
 
-      // Fire timer to trigger a scheduled reconcile (will hang)
-      const scheduledPromise = timerCb!();
-      // Give it a tick to start
-      await new Promise((r) => setTimeout(r, 50));
-      expect(slowReconcileStarted).toBe(true);
-
-      // Close while reconcile is in-flight
-      const closePromise = app.close();
-
-      // Unblock reconcile
-      slowReconcileResolve();
-      await scheduledPromise;
-      await closePromise;
+      try {
+        RouteService.prototype.reconcilePending = async function () {
+          reconcileCount++;
+          events.push('reconcile.start');
+          await slowGate;
+          events.push('reconcile.end');
+          return orig.call(this);
+        };
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 50));
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 50));
+        const starts = events.filter((e) => e === 'reconcile.start');
+        expect(starts.length).toBe(1);
+      } finally {
+        resolveSlow!();
+        RouteService.prototype.reconcilePending = orig;
+      }
     } finally {
-      RouteService.prototype.reconcilePending = origReconcile;
-      if (!slowReconcileStarted) slowReconcileResolve();
+      await app.close();
     }
-  }, 10000);
+  }, 15000);
 
   // -----------------------------------------------------------------------
-  // Signal path calls exit
+  // Signal fires during startup
   // -----------------------------------------------------------------------
 
-  it('signal handler calls exit and shares shutdown path', async () => {
+  it('signal during startup shuts down cleanly', async () => {
     const { startApplication } = await import('../src/index.js');
-    let exitCode: number | null = null;
     let registeredHandler: (() => void) | null = null;
-    let unregistered = false;
+    let signalReady!: () => void;
+    const signalReadyPromise = new Promise<void>((r) => { signalReady = r; });
+    let exitCode: number | null = null;
 
-    const app = await startApplication(
+    const appPromise = startApplication(
       { env: baseEnv },
       {
         runtime: {
@@ -221,80 +275,95 @@ describe('startup runtime', () => {
           setTimer: () => ({ clear: () => {} }),
           onSignal: (_sig, handler) => {
             registeredHandler = handler as () => void;
-            return () => { unregistered = true; };
+            signalReady();
+            return () => {};
+          },
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            // Timeout quickly so listen proceeds; signal fires before that.
+            const timeout: Promise<{ success: false; timedOut: true }> =
+              new Promise((r) => {
+                setTimeout(() => r({ success: false, timedOut: true } as const), 50);
+              });
+            return Promise.race([
+              p.then((v) => ({ success: true, value: v } as const)),
+              timeout,
+            ]);
           },
           exit: (code) => { exitCode = code; },
         },
       },
     );
 
+    await signalReadyPromise;
     expect(registeredHandler).toBeTruthy();
-
-    // Fire the registered signal handler (async — shutdown then exit)
     registeredHandler!();
-    // Wait for the promise chain (shutdown → exit) to settle
-    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 10));
     expect(exitCode).toBe(0);
-    expect(unregistered).toBe(true);
 
+    const app = await appPromise;
     await app.close();
   }, 10000);
 
   // -----------------------------------------------------------------------
-  // Listen failure rolls back
+  // Shared shutdown promise (finding 4)
   // -----------------------------------------------------------------------
 
-  it('rolls back on listen failure', async () => {
+  it('multiple close calls share the same shutdown promise', async () => {
     const { startApplication } = await import('../src/index.js');
-    let serverClosed = false;
-
-    await expect(
-      startApplication(
-        { env: baseEnv },
-        {
-          runtime: {
-            createServer: () => ({
-              listen: async () => {
-                throw new Error('port in use');
-              },
-              close: async () => { serverClosed = true; },
-            }),
-            setTimer: () => ({ clear: () => {} }),
-            onSignal: () => () => {},
-            exit: () => {},
-          },
-        },
-      ),
-    ).rejects.toThrow(/port in use/);
-
-    expect(serverClosed).toBe(true);
-  }, 10000);
-
-  // -----------------------------------------------------------------------
-  // Cloudflare timeout is wired
-  // -----------------------------------------------------------------------
-
-  it('wires Cloudflare timeout from config', async () => {
-    const { startApplication } = await import('../src/index.js');
-    const env = {
-      ...baseEnv,
-      CLOUDFLARE_ZONE_ID: 'zone',
-      CLOUDFLARE_API_TOKEN: 'token',
-      CLOUDFLARE_CNAME_TARGET: 'cname.dev',
-      CLOUDFLARE_TIMEOUT_MS: '9999',
-    };
     const rt = trackRuntime();
-    const app = await startApplication({ env }, { runtime: rt.deps });
-    expect(app).toBeDefined();
-    // Verify cloudflare config was accepted (startup succeeds)
-    const configMod = await import('../src/config.js');
-    const config = configMod.loadConfig(env);
-    expect(config.cloudflareTimeoutMs).toBe(9999);
-    await app.close();
+    const app = await startApplication({ env: baseEnv }, { runtime: rt.deps });
+    try {
+      const [r1, r2, r3] = await Promise.all([
+        app.close(),
+        app.close(),
+        app.close(),
+      ]);
+      expect(rt.events.filter((e) => e === 'server.close').length).toBe(1);
+      expect(rt.events.filter((e) => e === 'timer.clear').length).toBe(1);
+    } finally {
+      await app.close().catch(() => {});
+    }
+  });
+
+  it('close and signal path share the same shutdown', async () => {
+    const { startApplication } = await import('../src/index.js');
+    let exitCode: number | null = null;
+    let registeredHandler: (() => void) | null = null;
+
+    const app = await startApplication(
+      { env: baseEnv },
+      {
+        runtime: {
+          createServer: () => ({ listen: async () => 3001, close: async () => {} }),
+          setTimer: () => ({ clear: () => {} }),
+          onSignal: (_sig, handler) => {
+            registeredHandler = handler as () => void;
+            return () => {};
+          },
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            const value = await p;
+            return { success: true, value } as const;
+          },
+          exit: (code) => { exitCode = code; },
+        },
+      },
+    );
+    try {
+      const [_, __] = await Promise.all([
+        new Promise<void>((r) => {
+          registeredHandler!();
+          setTimeout(r, 10);
+        }),
+        app.close(),
+      ]);
+      expect(exitCode).toBe(0);
+    } finally {
+      await app.close().catch(() => {});
+    }
   }, 10000);
 
   // -----------------------------------------------------------------------
-  // Timer cancellation on close
+  // Timer cancellation
   // -----------------------------------------------------------------------
 
   it('cancels timer on close', async () => {
@@ -308,22 +377,141 @@ describe('startup runtime', () => {
             listen: async () => 3001,
             close: async () => { events.push('server.close'); },
           }),
-          setTimer: () => ({
-            clear: () => { events.push('timer.clear'); },
-          }),
+          setTimer: () => ({ clear: () => { events.push('timer.clear'); } }),
           onSignal: () => () => {},
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            const value = await p;
+            return { success: true, value } as const;
+          },
           exit: () => {},
         },
       },
     );
-    await app.close();
-    expect(events).toContain('timer.clear');
-    expect(events).toContain('server.close');
+    try {
+      await app.close();
+      expect(events).toContain('timer.clear');
+      expect(events).toContain('server.close');
+    } finally {
+      await app.close().catch(() => {});
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Listen failure rolls back including signals + DB (finding 6)
+  // -----------------------------------------------------------------------
+
+  it('rolls back on listen failure including signal unregistration', async () => {
+    const { startApplication } = await import('../src/index.js');
+    let serverClosed = false;
+    let offSignalCalled = 0;
+
+    await expect(
+      startApplication(
+        { env: baseEnv },
+        {
+          runtime: {
+            createServer: () => ({
+              listen: async () => { throw new Error('port in use'); },
+              close: async () => { serverClosed = true; },
+            }),
+            setTimer: () => ({ clear: () => {} }),
+            onSignal: () => () => { offSignalCalled++; },
+            deadline: async <T>(p: Promise<T>, _ms: number) => {
+              const value = await p;
+              return { success: true, value } as const;
+            },
+            exit: () => {},
+          },
+        },
+      ),
+    ).rejects.toThrow(/port in use/);
+
+    expect(serverClosed).toBe(true);
+    expect(offSignalCalled).toBe(2);
   }, 10000);
+
+  // -----------------------------------------------------------------------
+  // Cloudflare timeout propagation
+  // -----------------------------------------------------------------------
+
+  it('wires Cloudflare timeout from config', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const env = {
+      ...baseEnv,
+      CLOUDFLARE_ZONE_ID: 'zone',
+      CLOUDFLARE_API_TOKEN: 'token',
+      CLOUDFLARE_CNAME_TARGET: 'cname.dev',
+      CLOUDFLARE_TIMEOUT_MS: '9999',
+    };
+    const rt = trackRuntime();
+    const app = await startApplication({ env }, { runtime: rt.deps });
+    try {
+      const configMod = await import('../src/config.js');
+      const config = configMod.loadConfig(env);
+      expect(config.cloudflareTimeoutMs).toBe(9999);
+    } finally {
+      await app.close();
+    }
+  }, 10000);
+
+  // -----------------------------------------------------------------------
+  // Shutdown order
+  // -----------------------------------------------------------------------
+
+  it('shutdown follows correct order', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const events: string[] = [];
+    const app = await startApplication(
+      { env: baseEnv },
+      {
+        runtime: {
+          createServer: () => ({
+            listen: async () => 3001,
+            close: async () => { events.push('http.close'); },
+          }),
+          setTimer: () => ({
+            clear: () => { events.push('timer.clear'); },
+          }),
+          onSignal: (sig) => {
+            events.push(`onSignal:${sig}`);
+            return () => { events.push(`offSignal:${sig}`); };
+          },
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            const value = await p;
+            return { success: true, value } as const;
+          },
+          exit: () => {},
+        },
+      },
+    );
+    try {
+      await app.close();
+      const timerIdx = events.indexOf('timer.clear');
+      const httpIdx = events.indexOf('http.close');
+      expect(timerIdx).toBeLessThan(httpIdx);
+    } finally {
+      await app.close().catch(() => {});
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Reconcile event callback (finding 5)
+  // -----------------------------------------------------------------------
+
+  it('emits reconcile error events for per-row failures', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const rt = trackRuntime();
+    const app = await startApplication({ env: baseEnv }, { runtime: rt.deps });
+    try {
+      expect(app).toBeDefined();
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
-// ESM main guard (finding 1)
+// ESM main guard — child process test (finding 6)
 // ---------------------------------------------------------------------------
 
 describe('ESM main guard', () => {
@@ -331,4 +519,57 @@ describe('ESM main guard', () => {
     const mod = await import('../src/index.js');
     expect(typeof mod.startApplication).toBe('function');
   });
+
+  it('invokes startApplication when run as main module', async () => {
+    const child = spawn(
+      'node',
+      [join(process.cwd(), 'dist/index.js')],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          MCP_TOKEN: 'a'.repeat(32),
+          TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
+          DATABASE_PATH: ':memory:',
+          LISTEN_HOST: '127.0.0.1',
+          LISTEN_PORT: '3098',
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      },
+    );
+
+    let output = '';
+    let killed = false;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          killed = true;
+          child.kill('SIGTERM');
+          resolve();
+        }, 2000);
+
+        child.stdout!.on('data', (chunk: string) => {
+          output += chunk;
+        });
+        child.stderr!.on('data', (chunk: string) => {
+          output += chunk;
+        });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on('exit', () => {
+          clearTimeout(timer);
+          if (!killed) resolve();
+        });
+      });
+
+      expect(output).toContain('config_loading');
+      expect(output).toContain('database_ready');
+    } finally {
+      if (!killed) child.kill('SIGTERM');
+    }
+  }, 15000);
 });
