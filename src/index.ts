@@ -12,18 +12,9 @@ import { probeTcpPort } from './port-probe.js';
 import { CloudflareDnsManager } from './cloudflare.js';
 import type { DnsManager, PortProbe } from './domain.js';
 
-// ---------------------------------------------------------------------------
-// Migration folder resolved relative to this source file
-// ---------------------------------------------------------------------------
-
 const MIGRATIONS_FOLDER = new URL('../drizzle', import.meta.url).pathname;
 
-// ---------------------------------------------------------------------------
-// Structured logging — never leaks secrets
-// ---------------------------------------------------------------------------
-
 function log(event: string, extra?: Record<string, unknown>): void {
-  // eslint-disable-next-line no-console
   console.log(JSON.stringify({ event, ...extra }));
 }
 
@@ -46,7 +37,7 @@ export type DeadlineResult<T> =
 
 export interface RuntimeDeps {
   createServer(handler: Express): ServerHandle;
-  setTimer(fn: () => Promise<void>, ms: number): TimerHandle;
+  setTimer(fn: () => void, ms: number): TimerHandle;
   onSignal(sig: string, handler: () => void): () => void;
   exit(code: number): void;
   deadline<T>(promise: Promise<T>, ms: number): Promise<DeadlineResult<T>>;
@@ -95,7 +86,6 @@ const defaultRuntime: RuntimeDeps = {
           () => resolve({ success: false, timedOut: true } as const),
           ms,
         );
-        if (timeoutId.unref) timeoutId.unref();
       });
       return await Promise.race([
         promise.then((value) => ({ success: true, value } as const)),
@@ -126,18 +116,6 @@ const INITIAL_RECONCILE_DEADLINE_MS = 10_000;
 // startApplication
 // ---------------------------------------------------------------------------
 
-/**
- * Loads config, opens SQLite with migrations, constructs dependencies,
- * runs one bounded initial reconciliation, serves HTTP, schedules
- * retryable reconciliation every 30 seconds (single-flight), and handles
- * graceful shutdown on SIGINT / SIGTERM.
- *
- * Signal handlers are installed BEFORE the initial reconciliation so that
- * a signal during startup sets a `stopping` flag that aborts startup.
- *
- * On any startup failure all previously-acquired resources are rolled
- * back before the error propagates.
- */
 export async function startApplication(
   options: StartOptions,
   overrides?: { runtime?: Partial<RuntimeDeps> },
@@ -145,9 +123,6 @@ export async function startApplication(
   const runtime: RuntimeDeps = { ...defaultRuntime, ...overrides?.runtime };
   const { env } = options;
 
-  // ---------------------------------------------------------------------------
-  // Track acquired resources for rollback
-  // ---------------------------------------------------------------------------
   let dbCtx: ReturnType<typeof openDatabase> | null = null;
   let serverHandle: ServerHandle | null = null;
   let timerHandle: TimerHandle | null = null;
@@ -159,9 +134,6 @@ export async function startApplication(
 
   // Shared shutdown promise — concurrent close/signal callers await the same.
   let shutdownPromise: Promise<void> | null = null;
-
-  // Once true no new work begins and startup aborts.
-  let stopping = false;
 
   try {
     // -----------------------------------------------------------------------
@@ -221,8 +193,7 @@ export async function startApplication(
     // Stage 5 — Signal handlers (BEFORE initial reconcile)
     // -----------------------------------------------------------------------
     const shutdown = (): Promise<void> => {
-      if (shutdownPromise) return shutdownPromise;
-      stopping = true;
+      if (shutdownPromise !== null) return shutdownPromise;
       shutdownPromise = (async () => {
         log('shutdown_initiated');
         timerHandle?.clear();
@@ -244,7 +215,6 @@ export async function startApplication(
       );
     };
 
-    // Register both signals; if the second throws, roll back the first.
     const unregSigint = runtime.onSignal('SIGINT', onSignal);
     try {
       const unregSigterm = runtime.onSignal('SIGTERM', onSignal);
@@ -253,7 +223,7 @@ export async function startApplication(
         unregSigterm();
       };
     } catch {
-      unregSigint(); // clean up the already-registered SIGINT
+      unregSigint();
       throw new Error('Failed to register SIGTERM');
     }
     log('signal_handlers_installed');
@@ -263,8 +233,6 @@ export async function startApplication(
     // -----------------------------------------------------------------------
     log('initial_reconciliation');
 
-    // Track the promise before the deadline race so signal shutdown and
-    // the scheduler can see it.
     const initialReconcilePromise = service.reconcilePending();
 
     const tracked = initialReconcilePromise
@@ -274,38 +242,34 @@ export async function startApplication(
       });
     currentReconcile = tracked;
 
-    // Guard: if a signal fired before we finished setting up, await the
-    // tracked promise to settle, then abort.
-    if (stopping) {
+    // Guard: signal handler may have fired during reconcile setup.
+    // TS narrows the local const correctly.
+    const guardA = shutdownPromise as Promise<void> | null;
+    if (guardA !== null) {
       await tracked.catch(() => {});
       throw new Error('shutdown_during_startup');
     }
 
-    // Deadline uses the raw promise (which may reject).  Catch its
-    // rejection so there is never a detached unhandled rejection while
-    // tracked's .catch() remains the primary handler.
+    // Deadline uses the raw promise (may reject).  A rejection means
+    // the reconcile itself failed.  Log fixed code and propagate.
     let deadlineResult: DeadlineResult<unknown>;
     try {
       deadlineResult = await runtime.deadline(
         initialReconcilePromise,
         INITIAL_RECONCILE_DEADLINE_MS,
       );
-    } catch {
-      // The raw promise rejected (e.g. DB was closed by shutdown).
-      // Treat as deadline timeout so startup continues with
-      // currentReconcile set and the scheduler skips.
-      deadlineResult = { success: false, timedOut: true };
+    } catch (err) {
+      log('initial_reconciliation_error', { code: 'INTERNAL_ERROR' });
+      throw err;
     }
 
-    if (stopping) {
+    const guardB = shutdownPromise as Promise<void> | null;
+    if (guardB !== null) {
       await tracked.catch(() => {});
       throw new Error('shutdown_during_startup');
     }
 
     if (!deadlineResult.success) {
-      // Timed out — `currentReconcile` stays set so the scheduler skips
-      // overlap and shutdown awaits it.  When the promise settles,
-      // `.finally()` above clears it (if still current).
       log('initial_reconciliation_deadline');
     } else {
       log('initial_reconciliation_done');
@@ -314,21 +278,34 @@ export async function startApplication(
     // -----------------------------------------------------------------------
     // Stage 7 — Listen
     // -----------------------------------------------------------------------
-    if (stopping) {
-      await currentReconcile?.catch(() => {});
+    const guardC = shutdownPromise as Promise<void> | null;
+    if (guardC !== null) {
+      await guardC.catch(() => {});
       throw new Error('shutdown_during_startup');
     }
     const assignedPort = await serverHandle.listen(
       config.listenPort,
       config.listenHost,
     );
+    {
+      const guardD = shutdownPromise as Promise<void> | null;
+      if (guardD !== null) {
+        await guardD.catch(() => {});
+        throw new Error('shutdown_during_startup');
+      }
+    }
     log('http_listening', { port: assignedPort });
 
     // -----------------------------------------------------------------------
     // Stage 8 — Scheduled single-flight reconciliation
     // -----------------------------------------------------------------------
-    const runScheduledReconcile = async (): Promise<void> => {
-      if (stopping || currentReconcile !== null) return;
+    const guardE = shutdownPromise as Promise<void> | null;
+    if (guardE !== null) {
+      await guardE.catch(() => {});
+      throw new Error('shutdown_during_startup');
+    }
+    const runScheduledReconcile = (): void => {
+      if (shutdownPromise !== null || currentReconcile !== null) return;
       const sched = service
         .reconcilePending()
         .catch(() => {})
@@ -336,10 +313,16 @@ export async function startApplication(
           if (currentReconcile === sched) currentReconcile = null;
         });
       currentReconcile = sched;
-      await sched;
+      sched.catch(() => {});
     };
 
     timerHandle = runtime.setTimer(runScheduledReconcile, 30_000);
+    const guardF = shutdownPromise as Promise<void> | null;
+    if (guardF !== null) {
+      timerHandle.clear();
+      await guardF.catch(() => {});
+      throw new Error('shutdown_during_startup');
+    }
     log('scheduler_started', { intervalMs: 30_000 });
 
     // -----------------------------------------------------------------------
@@ -353,15 +336,20 @@ export async function startApplication(
     };
   } catch (err) {
     // -----------------------------------------------------------------------
-    // Rollback — close resources in reverse order
+    // Rollback — when stopping, the shared shutdown already handled cleanup.
     // -----------------------------------------------------------------------
-    timerHandle?.clear();
-    if (unregisterSignal) unregisterSignal();
-    await serverHandle?.close().catch(() => {});
-    if (currentReconcile !== null) {
-      await currentReconcile.catch(() => {});
+    const guardG = shutdownPromise as Promise<void> | null;
+    if (guardG !== null) {
+      await guardG.catch(() => {});
+    } else {
+      timerHandle?.clear();
+      if (unregisterSignal) unregisterSignal();
+      await serverHandle?.close().catch(() => {});
+      if (currentReconcile !== null) {
+        await currentReconcile.catch(() => {});
+      }
+      try { dbCtx?.close(); } catch { /* already closed */ }
     }
-    try { dbCtx?.close(); } catch { /* already closed */ }
     throw err;
   }
 }

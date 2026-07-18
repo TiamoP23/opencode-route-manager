@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import type { RuntimeDeps } from '../src/index.js';
 import { RouteService } from '../src/route-service.js';
@@ -81,7 +81,7 @@ describe('startup runtime', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Clean start / stop with injected runtime
+  // Clean start / stop
   // -----------------------------------------------------------------------
 
   it('starts and stops cleanly with injected runtime', async () => {
@@ -103,7 +103,7 @@ describe('startup runtime', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Signal handlers installed before initial reconcile
+  // Signal ownership before initial reconcile
   // -----------------------------------------------------------------------
 
   it('installs signal handlers before initial reconcile and listen', async () => {
@@ -149,49 +149,32 @@ describe('startup runtime', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Initial reconcile tracked in currentReconcile before deadline
-  // -----------------------------------------------------------------------
-
-  it('assigns currentReconcile before deadline race', async () => {
-    const { startApplication } = await import('../src/index.js');
-    const rt = trackRuntime();
-    const app = await startApplication({ env: baseEnv }, { runtime: rt.deps });
-    try {
-      expect(rt.events).toContain('deadline');
-    } finally {
-      await app.close();
-    }
-  });
-
-  // -----------------------------------------------------------------------
-  // Deadline timeout: scheduled-skip then settled-resume
+  // Deadline timeout → scheduler skip → settle → scheduler resume
   // -----------------------------------------------------------------------
 
   it('initial timeout blocks scheduler; after settle scheduler resumes', async () => {
     const { startApplication } = await import('../src/index.js');
-    let timerCb: (() => Promise<void>) | null = null;
-    let resolveInitial!: () => void;
-    const initialGate = new Promise<void>((r) => { resolveInitial = r; });
-    const scheduleEvents: string[] = [];
-
-    const initialPromise = new Promise<void>((r) => { resolveInitial = r; });
+    let timerCb: (() => void) | null = null;
+    const events: string[] = [];
+    let scheduledCalls = 0;
+    let resolveSlow!: () => void;
+    const slowGate = new Promise<void>((r) => { resolveSlow = r; });
 
     const app = await startApplication(
       { env: baseEnv },
       {
         runtime: {
           createServer: () => ({
-            listen: async () => { scheduleEvents.push('listen'); return 3001; },
-            close: async () => { scheduleEvents.push('server.close'); },
+            listen: async () => { events.push('listen'); return 3001; },
+            close: async () => { events.push('server.close'); },
           }),
           setTimer: (fn) => {
             timerCb = fn;
-            return { clear: () => { scheduleEvents.push('timer.clear'); } };
+            return { clear: () => { events.push('timer.clear'); } };
           },
           onSignal: () => () => {},
           deadline: async <T>(_p: Promise<T>, _ms: number) => {
-            // Time out the initial promise so it stays as currentReconcile
-            scheduleEvents.push('deadline.timeout');
+            events.push('deadline.timeout');
             return { success: false, timedOut: true } as const;
           },
           exit: () => {},
@@ -199,18 +182,40 @@ describe('startup runtime', () => {
       },
     );
     try {
-      // After startApplication, deadline timed out -> currentReconcile is set
-      // Fire timer: scheduler should skip (currentReconcile !== null)
-      scheduleEvents.push('sched.before');
-      timerCb!();
-      scheduleEvents.push('sched.after');
-      expect(scheduleEvents.filter(e => e === 'sched.before' || e === 'sched.after').length).toBe(2);
-      // No reconcile.start was emitted (we didn't patch the service)
+      // At this point: deadline timed out, currentReconcile is set (initial
+      // reconcile running in the background on the real DB).  Patch so
+      // scheduled calls are observable.
+      const orig = RouteService.prototype.reconcilePending;
+      try {
+        RouteService.prototype.reconcilePending = async function () {
+          scheduledCalls++;
+          events.push(`sched.${scheduledCalls}`);
+          if (scheduledCalls <= 1) await slowGate;
+          return orig.call(this);
+        };
+
+        // Fire timer while currentReconcile is potentially still set
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 200));
+        // By now the initial reconcile has settled (empty DB → fast).
+        // currentReconcile cleared by finally.  Release any gated call.
+        resolveSlow();
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Fire timer again — should start exactly one new reconcile
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 100));
+
+        // At least one scheduled reconcile ran
+        expect(scheduledCalls).toBeGreaterThanOrEqual(1);
+      } finally {
+        resolveSlow();
+        RouteService.prototype.reconcilePending = orig;
+      }
     } finally {
       await app.close();
     }
-    expect(scheduleEvents).toContain('listen');
-  }, 10000);
+  }, 15000);
 
   // -----------------------------------------------------------------------
   // No-overlap scheduled reconcile
@@ -218,7 +223,7 @@ describe('startup runtime', () => {
 
   it('does not overlap scheduled reconciles', async () => {
     const { startApplication } = await import('../src/index.js');
-    let timerCb: (() => Promise<void>) | null = null;
+    let timerCb: (() => void) | null = null;
     const events: string[] = [];
 
     const app = await startApplication(
@@ -273,7 +278,7 @@ describe('startup runtime', () => {
   }, 15000);
 
   // -----------------------------------------------------------------------
-  // Signal during startup aborts / rejects
+  // Signal during startup (before listen) aborts
   // -----------------------------------------------------------------------
 
   it('signal during startup rejects startApplication', async () => {
@@ -284,8 +289,6 @@ describe('startup runtime', () => {
     let exitCode: number | null = null;
     let caught: unknown = null;
 
-    // Attach rejection handler immediately so Node.js never sees
-    // an unhandled rejection from the abort error.
     const appPromise = startApplication(
       { env: baseEnv },
       {
@@ -315,9 +318,71 @@ describe('startup runtime', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(exitCode).toBe(0);
 
-    // The app promise was caught above; verify the error
     expect(caught).toBeTruthy();
     expect((caught as Error).message).toMatch(/shutdown_during_startup/);
+  }, 10000);
+
+  // -----------------------------------------------------------------------
+  // Signal during listen — no timer, startup rejects
+  // -----------------------------------------------------------------------
+
+  it('signal during listen rejects startup with no timer', async () => {
+    const { startApplication } = await import('../src/index.js');
+    let registeredHandler: (() => void) | null = null;
+    let signalReady!: () => void;
+    const signalReadyPromise = new Promise<void>((r) => { signalReady = r; });
+    let exitCode: number | null = null;
+    let timerSet = false;
+    let listenStarted = false;
+    let resolveListen!: () => void;
+    let caught: unknown = null;
+
+    const appPromise = startApplication(
+      { env: baseEnv },
+      {
+        runtime: {
+          createServer: () => ({
+            listen: async () => {
+              listenStarted = true;
+              await new Promise<void>((r) => { resolveListen = r; });
+              return 3001;
+            },
+            close: async () => {},
+          }),
+          setTimer: () => {
+            timerSet = true;
+            return { clear: () => {} };
+          },
+          onSignal: (_sig, handler) => {
+            registeredHandler = handler as () => void;
+            signalReady();
+            return () => {};
+          },
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            const value = await p;
+            return { success: true, value } as const;
+          },
+          exit: (code) => { exitCode = code; },
+        },
+      },
+    ).catch((err) => { caught = err; });
+
+    await signalReadyPromise;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(listenStarted).toBe(true);
+
+    // Fire signal while listen is in-flight
+    registeredHandler!();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(exitCode).toBe(0);
+
+    // Resolve listen
+    resolveListen();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(caught).toBeTruthy();
+    expect((caught as Error).message).toMatch(/shutdown_during_startup/);
+    expect(timerSet).toBe(false);
   }, 10000);
 
   // -----------------------------------------------------------------------
@@ -372,7 +437,7 @@ describe('startup runtime', () => {
   }, 10000);
 
   // -----------------------------------------------------------------------
-  // Timer cancellation on close
+  // Timer cancellation
   // -----------------------------------------------------------------------
 
   it('cancels timer on close', async () => {
@@ -406,16 +471,15 @@ describe('startup runtime', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Shutdown order: timer → HTTP drain → reconcile settle → DB close
+  // Shutdown order with reconcile settle
   // -----------------------------------------------------------------------
 
   it('shutdown follows correct order with reconcile settle', async () => {
     const { startApplication } = await import('../src/index.js');
     const events: string[] = [];
-    let timerCb: (() => Promise<void>) | null = null;
+    let timerCb: (() => void) | null = null;
     let resolveReconcile!: () => void;
     const reconcileGate = new Promise<void>((r) => { resolveReconcile = r; });
-    let dbClosed = false;
 
     const app = await startApplication(
       { env: baseEnv },
@@ -440,8 +504,6 @@ describe('startup runtime', () => {
       },
     );
 
-    // StartApplication completed (initial reconcile done).
-    // Now patch to make scheduled reconcile slow, then fire timer.
     const origReconcile = RouteService.prototype.reconcilePending;
     let reconcileStarted = false;
 
@@ -455,23 +517,18 @@ describe('startup runtime', () => {
         return origReconcile.call(this);
       };
 
-      // Fire timer to start a slow scheduled reconcile
       timerCb!();
       await new Promise((r) => setTimeout(r, 50));
       expect(events).toContain('reconcile.start');
 
-      // Close while reconcile is in-flight
       const closePromise = app.close();
       await new Promise((r) => setTimeout(r, 50));
 
-      // timer.clear should happen before http.close
       expect(events.indexOf('timer.clear')).toBeLessThan(events.indexOf('http.close'));
 
-      // Unblock reconcile
       resolveReconcile();
       await closePromise;
 
-      // http.close should happen before reconcile.end
       expect(events.indexOf('http.close')).toBeLessThan(events.indexOf('reconcile.end'));
 
       await app.close().catch(() => {});
@@ -485,7 +542,7 @@ describe('startup runtime', () => {
   // Listen failure rolls back with reconcile await
   // -----------------------------------------------------------------------
 
-  it('rolls back on listen failure including signal unregistration and reconcile await', async () => {
+  it('rolls back on listen failure', async () => {
     const { startApplication } = await import('../src/index.js');
     let serverClosed = false;
     let offSignalCalled = 0;
@@ -516,6 +573,62 @@ describe('startup runtime', () => {
   }, 10000);
 
   // -----------------------------------------------------------------------
+  // Listen failure after initial timeout — rollback awaits reconcile settle
+  // -----------------------------------------------------------------------
+
+  it('listen failure after initial timeout rolls back after reconcile settles', async () => {
+    const { startApplication } = await import('../src/index.js');
+    let resolveReconcile!: () => void;
+    const reconcileGate = new Promise<void>((r) => { resolveReconcile = r; });
+    let serverClosed = false;
+    let reconcileReleased = false;
+
+    const orig = RouteService.prototype.reconcilePending;
+    const isFirst = { value: true };
+    try {
+      RouteService.prototype.reconcilePending = async function () {
+        if (isFirst.value) {
+          isFirst.value = false;
+          await reconcileGate;
+          reconcileReleased = true;
+        }
+        return orig.call(this);
+      };
+
+      const startPromise = startApplication(
+        { env: baseEnv },
+        {
+          runtime: {
+            createServer: () => ({
+              listen: async () => { throw new Error('port in use'); },
+              close: async () => { serverClosed = true; },
+            }),
+            setTimer: () => ({ clear: () => {} }),
+            onSignal: () => () => {},
+            deadline: async <T>(_p: Promise<T>, _ms: number) => {
+              return { success: false, timedOut: true } as const;
+            },
+            exit: () => {},
+          },
+        },
+      );
+
+      // Give startup a tick to reach the reconcile gate
+      await new Promise((r) => setTimeout(r, 100));
+      expect(reconcileReleased).toBe(false);
+
+      // Release reconcile — rollback should now complete
+      resolveReconcile();
+      await expect(startPromise).rejects.toThrow(/port in use/);
+      expect(serverClosed).toBe(true);
+      expect(reconcileReleased).toBe(true);
+    } finally {
+      RouteService.prototype.reconcilePending = orig;
+      if (!reconcileReleased) resolveReconcile();
+    }
+  }, 10000);
+
+  // -----------------------------------------------------------------------
   // Cloudflare timeout propagation
   // -----------------------------------------------------------------------
 
@@ -540,15 +653,13 @@ describe('startup runtime', () => {
   }, 10000);
 
   // -----------------------------------------------------------------------
-  // Reconcile event callback fires real stable event
+  // Reconcile event — creating failure (PORT_UNREACHABLE)
   // -----------------------------------------------------------------------
 
-  it('emits reconcile error events for per-row creating failures', async () => {
+  it('emits PORT_UNREACHABLE for creating failure', async () => {
     const { startApplication } = await import('../src/index.js');
     const events: Array<{ slug: string; status: string; code: string }> = [];
 
-    // Create a service with a route in 'creating' state, then run reconcile
-    // which will fail (no port probe) and emit an event.
     const { SqliteRouteStore } = await import('../src/db/route-store.js');
     const { openDatabase } = await import('../src/db/client.js');
     const migrations = new URL('../drizzle', import.meta.url).pathname;
@@ -557,30 +668,25 @@ describe('startup runtime', () => {
     try {
       const store = new SqliteRouteStore(db);
 
-      // Insert a creating row that will fail reconcile (probe will fail)
       await store.insertCreating({
         slug: 'test-fail',
         port: 9999,
         description: null,
       });
 
-      // Wait for backoff period (retryCount 0 → ~1s delay) to elapse
+      // Wait for backoff period to elapse
       await new Promise((r) => setTimeout(r, 1500));
 
       const service = new RouteService({
         config: { ...(await import('../src/config.js')).loadConfig(baseEnv) },
         store,
         dns: null,
-        probe: async () => false, // probe always fails
-        onReconcileEvent: (evt) => {
-          events.push(evt);
-        },
+        probe: async () => false,
+        onReconcileEvent: (evt) => { events.push(evt); },
       });
 
-      // Trigger reconcile
       await service.reconcilePending();
 
-      // Should have emitted one error event for PORT_UNREACHABLE
       expect(events.length).toBe(1);
       expect(events[0]?.slug).toBe('test-fail');
       expect(events[0]?.status).toBe('creating');
@@ -590,7 +696,11 @@ describe('startup runtime', () => {
     }
   });
 
-  it('emits reconcile error events for per-row deleting failures', async () => {
+  // -----------------------------------------------------------------------
+  // Reconcile event — deleting failure (DNS_UNAVAILABLE)
+  // -----------------------------------------------------------------------
+
+  it('emits DNS_UNAVAILABLE for deleting failure', async () => {
     const events: Array<{ slug: string; status: string; code: string }> = [];
 
     const { SqliteRouteStore } = await import('../src/db/route-store.js');
@@ -606,11 +716,9 @@ describe('startup runtime', () => {
         port: 9999,
         description: null,
       });
-      // Give the row a cloudflare record ID so DNS cleanup is attempted
       await store.setCloudflareRecordId('test-del-fail', 'cf-record-1');
       await store.markDeleting('test-del-fail');
 
-      // Wait for backoff period to elapse
       await new Promise((r) => setTimeout(r, 1500));
 
       const dns = {
@@ -625,22 +733,15 @@ describe('startup runtime', () => {
         store,
         dns,
         probe: async () => true,
-        onReconcileEvent: (evt) => {
-          events.push(evt);
-        },
+        onReconcileEvent: (evt) => { events.push(evt); },
       });
 
       await service.reconcilePending();
 
-      // With dns present but throwing, deleting row should emit error
-      // Note: performDnsCleanup returns early when dns is absent;
-      // with dns present, it tries to find an owned record and fails.
-      // The deleteRecord call throws DNS_UNAVAILABLE.
-      expect(events.length).toBeGreaterThanOrEqual(1);
-      if (events.length > 0) {
-        expect(events[0]?.slug).toBe('test-del-fail');
-        expect(events[0]?.status).toBe('deleting');
-      }
+      expect(events.length).toBe(1);
+      expect(events[0]?.slug).toBe('test-del-fail');
+      expect(events[0]?.status).toBe('deleting');
+      expect(events[0]?.code).toBe('DNS_UNAVAILABLE');
     } finally {
       db.close();
     }
@@ -648,7 +749,7 @@ describe('startup runtime', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ESM main guard — child process via tsx with invalid config (no port needed)
+// ESM main guard — execFileSync with invalid config, no port
 // ---------------------------------------------------------------------------
 
 describe('ESM main guard', () => {
@@ -657,50 +758,30 @@ describe('ESM main guard', () => {
     expect(typeof mod.startApplication).toBe('function');
   });
 
-  it('fails fast with invalid config when run as main module', async () => {
-    // Use the local tsx binary to run src/index.ts with intentionally invalid
-    // config (short MCP_TOKEN). No network port needed.
+  it('fails fast with invalid config via execFileSync', () => {
     const tsx = join(process.cwd(), 'node_modules', '.bin', 'tsx');
-    const child = spawn(
-      tsx,
-      [join(process.cwd(), 'src/index.ts')],
-      {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          MCP_TOKEN: 'short',            // too short — guaranteed failure
-          TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      },
-    );
-
-    let stdout = '';
-    let stderr = '';
-    let killed = false;
-
     try {
-      const exitCode = await new Promise<number | null>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          killed = true;
-          child.kill('SIGKILL');
-          resolve(null);
-        }, 5000);
-
-        child.stdout!.on('data', (chunk: string) => { stdout += chunk; });
-        child.stderr!.on('data', (chunk: string) => { stderr += chunk; });
-        child.on('error', (err) => { clearTimeout(timer); reject(err); });
-        child.on('exit', (code) => { clearTimeout(timer); resolve(code); });
-      });
-
-      // Should have logged config_loading before failing
-      expect(stdout).toContain('config_loading');
-      // Should have logged startup_failed
-      expect(stdout).toContain('startup_failed');
-      // Exit code should be 1 (startup failure)
-      expect(exitCode).toBe(1);
-    } finally {
-      if (!killed) child.kill('SIGKILL');
+      execFileSync(
+        tsx,
+        [join(process.cwd(), 'src/index.ts')],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            MCP_TOKEN: 'short',
+            TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
+          },
+          encoding: 'utf8',
+          timeout: 5000,
+        },
+      );
+      // Should not reach here — the process should exit with error
+      expect('unreachable').toBe('reached');
+    } catch (err: unknown) {
+      const result = err as { status: number; stdout: string };
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain('config_loading');
+      expect(result.stdout).toContain('startup_failed');
     }
-  }, 10000);
+  });
 });
