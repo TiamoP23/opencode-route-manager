@@ -4,6 +4,8 @@ import type { AddressInfo } from 'net';
 export interface RecordedCall {
   method: string;
   path: string;
+  /** Query string without leading `?`; empty string when absent. */
+  query: string;
   authorization: string | null;
   body: unknown;
 }
@@ -22,8 +24,12 @@ export interface CloudflareFakeServer {
   url: string;
   calls: readonly RecordedCall[];
   setRecords: (records: FakeDnsRecord[]) => void;
+  /** Next single request returns this HTTP status instead of normal handling. */
   setNextError: (status: number) => void;
+  /** Override the response for the next list request. */
   setListResponse: (records: FakeDnsRecord[], status?: number) => void;
+  /** When a GET-by-ID matches the given recordId, return this HTTP status. */
+  setRecordError: (recordId: string, status: number) => void;
   destroy: () => Promise<void>;
 }
 
@@ -32,16 +38,17 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
   const calls: RecordedCall[] = [];
   let nextError: number | null = null;
   let listOverride: { records: FakeDnsRecord[]; status?: number | undefined } | null = null;
+  const recordErrors: Record<string, number> = {};
 
   const server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk);
     const bodyStr = Buffer.concat(chunks).toString('utf-8');
 
-    const path = req.url ?? '/';
-    const queryIdx = path.indexOf('?');
-    const pathname = queryIdx >= 0 ? path.slice(0, queryIdx) : path;
-    const queryStr = queryIdx >= 0 ? path.slice(queryIdx) : '';
+    const rawUrl = req.url ?? '/';
+    const queryIdx = rawUrl.indexOf('?');
+    const pathname = queryIdx >= 0 ? rawUrl.slice(0, queryIdx) : rawUrl;
+    const queryStr = queryIdx >= 0 ? rawUrl.slice(queryIdx + 1) : '';
     const queryParams = new URLSearchParams(queryStr);
 
     const auth = (req.headers['authorization'] as string) ?? null;
@@ -49,6 +56,7 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
     calls.push({
       method: req.method ?? 'GET',
       path: pathname,
+      query: queryStr,
       authorization: auth,
       body: bodyStr ? JSON.parse(bodyStr) : null,
     });
@@ -80,32 +88,20 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
 
     const recordId = match[2];
 
-    if (req.method === 'GET' && !recordId) {
-      // List records - support name.exact filtering
-      const exactName = queryParams.get('name.exact');
-      const source = listOverride ?? { records };
-      let filtered = source.records;
-      if (exactName) {
-        filtered = filtered.filter(r => r.name === exactName);
+    // GET by ID (single record fetch) — may have per-record error overrides
+    if (req.method === 'GET' && recordId) {
+      const errorStatus = recordErrors[recordId];
+      if (errorStatus) {
+        res.statusCode = errorStatus;
+        res.end(JSON.stringify({
+          success: false,
+          errors: [{ code: errorStatus, message: http.STATUS_CODES[errorStatus] ?? 'Error' }],
+          messages: [],
+          result: null,
+        }));
+        return;
       }
-      listOverride = null;
 
-      res.statusCode = source.status ?? 200;
-      res.end(JSON.stringify({
-        success: (source.status ?? 200) < 400,
-        errors: [],
-        messages: [],
-        result: filtered,
-        result_info: {
-          page: 1,
-          per_page: 100,
-          total_pages: 1,
-          count: filtered.length,
-          total_count: filtered.length,
-        },
-      }));
-    } else if (req.method === 'GET' && recordId) {
-      // Get by ID
       const record = records.find(r => r.id === recordId);
       if (!record) {
         res.statusCode = 404;
@@ -114,8 +110,44 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
         res.statusCode = 200;
         res.end(JSON.stringify({ success: true, errors: [], messages: [], result: record }));
       }
-    } else if (req.method === 'POST' && !recordId) {
-      // Create record
+      return;
+    }
+
+    // List records — support name.exact filtering and pagination
+    if (req.method === 'GET' && !recordId) {
+      const exactName = queryParams.get('name.exact');
+      const source = listOverride ?? { records };
+      let filtered = source.records;
+      if (exactName) {
+        filtered = filtered.filter(r => r.name === exactName);
+      }
+      listOverride = null;
+
+      const page = Math.max(1, parseInt(queryParams.get('page') ?? '1', 10) || 1);
+      const perPage = Math.max(1, parseInt(queryParams.get('per_page') ?? '100', 10) || 100);
+      const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
+      const start = (page - 1) * perPage;
+      const pageRecords = filtered.slice(start, start + perPage);
+
+      res.statusCode = source.status ?? 200;
+      res.end(JSON.stringify({
+        success: (source.status ?? 200) < 400,
+        errors: [],
+        messages: [],
+        result: pageRecords,
+        result_info: {
+          page,
+          per_page: perPage,
+          total_pages: totalPages,
+          count: pageRecords.length,
+          total_count: filtered.length,
+        },
+      }));
+      return;
+    }
+
+    // Create record
+    if (req.method === 'POST' && !recordId) {
       const body = JSON.parse(bodyStr);
       const newRecord: FakeDnsRecord = {
         id: `fake-cf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -130,7 +162,11 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
 
       res.statusCode = 200;
       res.end(JSON.stringify({ success: true, errors: [], messages: [], result: newRecord }));
-    } else if (req.method === 'DELETE' && recordId) {
+      return;
+    }
+
+    // Delete record
+    if (req.method === 'DELETE' && recordId) {
       const idx = records.findIndex(r => r.id === recordId);
       if (idx >= 0) {
         records.splice(idx, 1);
@@ -140,10 +176,11 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
         res.statusCode = 404;
         res.end(JSON.stringify({ success: false, errors: [{ code: 1003, message: 'Not found' }], messages: [], result: null }));
       }
-    } else {
-      res.statusCode = 405;
-      res.end(JSON.stringify({ success: false, errors: [{ code: 1003, message: 'Method not allowed' }], messages: [], result: null }));
+      return;
     }
+
+    res.statusCode = 405;
+    res.end(JSON.stringify({ success: false, errors: [{ code: 1003, message: 'Method not allowed' }], messages: [], result: null }));
   });
 
   return new Promise((resolve, reject) => {
@@ -162,6 +199,9 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
         },
         setListResponse(overrideRecords: FakeDnsRecord[], status?: number) {
           listOverride = { records: overrideRecords, status };
+        },
+        setRecordError(recordId: string, status: number) {
+          recordErrors[recordId] = status;
         },
         destroy: () => new Promise<void>(resolveClose => server.close(() => resolveClose())),
       });

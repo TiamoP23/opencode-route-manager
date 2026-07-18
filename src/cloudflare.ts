@@ -4,6 +4,23 @@ import { RouteManagerError } from './errors.js';
 const DEFAULT_BASE_URL = 'https://api.cloudflare.com/client/v4';
 const DEFAULT_TIMEOUT_MS = 10000;
 
+// ---------------------------------------------------------------------------
+// Internal helpers (not exported)
+// ---------------------------------------------------------------------------
+
+/**
+ * Typed HTTP error used internally to distinguish a true HTTP 404 from other
+ * Cloudflare API errors. Never exposed to callers.
+ */
+class CloudflareHttpError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`Cloudflare responded with HTTP ${status}`);
+    this.name = 'CloudflareHttpError';
+    this.status = status;
+  }
+}
+
 interface CloudflareApiResponse<T> {
   success: boolean;
   errors: Array<{ code: number; message: string }>;
@@ -27,6 +44,10 @@ interface CloudflareDnsRecord {
   ttl: number;
   comment: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// Public class
+// ---------------------------------------------------------------------------
 
 export class CloudflareDnsManager implements DnsManager {
   private config: CloudflareConfig;
@@ -62,10 +83,15 @@ export class CloudflareDnsManager implements DnsManager {
 
   /**
    * Low-level request against the Cloudflare API.
-   * Maps HTTP status codes to typed errors and always parses the Cloudflare
-   * envelope. Never exposes raw HTTP bodies or headers in public messages.
+   * Returns the full parsed envelope so callers can inspect `result_info`
+   * for pagination. Never exposes raw HTTP bodies or headers in public
+   * messages.
    */
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<CloudflareApiResponse<T>> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.config.apiToken}`,
@@ -100,8 +126,13 @@ export class CloudflareDnsManager implements DnsManager {
       throw new RouteManagerError('DNS_UNAVAILABLE', 'Cloudflare DNS is temporarily unavailable');
     }
 
-    // Parse body — a JSON parse failure here is treated as an unexpected
-    // server response and is not retried by default.
+    // Any other non-ok status (including 404, 400, 405, etc.) is wrapped in a
+    // typed HTTP error so callers can distinguish 404 from other failures.
+    if (!response.ok) {
+      throw new CloudflareHttpError(response.status);
+    }
+
+    // Parse body
     let bodyJson: CloudflareApiResponse<T>;
     try {
       bodyJson = (await response.json()) as CloudflareApiResponse<T>;
@@ -109,35 +140,39 @@ export class CloudflareDnsManager implements DnsManager {
       throw new RouteManagerError('DNS_CONFLICT', 'Cloudflare rejected the DNS change');
     }
 
-    if (!response.ok || !bodyJson.success) {
+    // 200-level response with success:false is a Cloudflare-domain error
+    if (!bodyJson.success) {
       throw new RouteManagerError('DNS_CONFLICT', 'Cloudflare rejected the DNS change');
     }
 
-    return bodyJson.result;
+    return bodyJson;
   }
 
   /**
    * Fetch a single DNS record by ID, returning `null` when the record does
-   * not exist (HTTP 404). Any other error propagates as normal.
+   * not exist (HTTP 404 only). All other non-ok HTTP statuses (400, 405,
+   * etc.) are converted to DNS_CONFLICT so they surface as typed errors.
    */
   private async fetchRecordById(recordId: string): Promise<CloudflareDnsRecord | null> {
     try {
-      return await this.request<CloudflareDnsRecord>(
+      const resp = await this.request<CloudflareDnsRecord>(
         'GET',
         `/zones/${this.config.zoneId}/dns_records/${recordId}`,
       );
+      return resp.result;
     } catch (err) {
-      if (err instanceof RouteManagerError && err.code === 'DNS_CONFLICT') {
-        // 404 falls through here — treat as "not found"
-        return null;
+      if (err instanceof CloudflareHttpError) {
+        if (err.status === 404) return null; // idempotent absence
+        // Any other non-ok HTTP status → DNS_CONFLICT
+        throw new RouteManagerError('DNS_CONFLICT', 'Cloudflare rejected the DNS change');
       }
-      throw err;
+      throw err; // RouteManagerError propagates unchanged
     }
   }
 
   /**
    * List all DNS records for a given hostname via exact-name filtering.
-   * Follows the Cloudflare `total_pages` pagination convention.
+   * Follows `result_info.total_pages` from the Cloudflare API.
    */
   private async listRecords(hostname: string): Promise<CloudflareDnsRecord[]> {
     const allRecords: CloudflareDnsRecord[] = [];
@@ -148,37 +183,41 @@ export class CloudflareDnsManager implements DnsManager {
       const path =
         `/zones/${this.config.zoneId}/dns_records?name.exact=${encodeURIComponent(hostname)}&per_page=100&page=${page}`;
 
-      const result = await this.request<CloudflareDnsRecord[]>(
-        'GET',
-        path,
-      );
+      const resp = await this.request<CloudflareDnsRecord[]>('GET', path);
 
-      // request() returns just the `result` array — we don't have the
-      // result_info from the envelope here. For the fake-server tests we
-      // will rarely paginate, but the implementation handles it when the
-      // response includes pagination info via a simple heuristic: if we
-      // got a full page, try the next page.
-      if (Array.isArray(result)) {
-        allRecords.push(...result);
-        // If this page returned fewer than per_page we're done
-        if (result.length < 100) break;
-        page++;
-      } else {
-        break;
+      if (Array.isArray(resp.result)) {
+        allRecords.push(...resp.result);
       }
+
+      // Use total_pages from the API response for subsequent iterations
+      totalPages = Math.max(totalPages, resp.result_info?.total_pages ?? page);
+      page++;
     }
 
     return allRecords;
   }
 
   /**
-   * Filter owned records from a list.
+   * Return the subset of records that match ownership criteria.
    */
   private ownedRecords(
     records: CloudflareDnsRecord[],
     slug: string,
   ): CloudflareDnsRecord[] {
     return records.filter((r) => this.isOwned(r, slug));
+  }
+
+  /**
+   * True when the complete exact-name result set consists of exactly one
+   * record that is owned. Mixed sets (owned + unowned) are rejected.
+   */
+  private soleOwnedRecord(
+    records: CloudflareDnsRecord[],
+    slug: string,
+  ): CloudflareDnsRecord | null {
+    if (records.length !== 1) return null;
+    const candidate = records[0]!;
+    return this.isOwned(candidate, slug) ? candidate : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -189,10 +228,8 @@ export class CloudflareDnsManager implements DnsManager {
     const records = await this.listRecords(hostname);
     if (records.length === 0) return;
 
-    const owned = this.ownedRecords(records, slug);
-
-    // Allow exactly one owned record (adoption path)
-    if (owned.length === 1 && records.length === 1) return;
+    // Allow only when the complete set is exactly one owned record
+    if (this.soleOwnedRecord(records, slug) !== null) return;
 
     throw new RouteManagerError(
       'DNS_CONFLICT',
@@ -203,15 +240,15 @@ export class CloudflareDnsManager implements DnsManager {
   async findOwnedRecord(hostname: string, slug: string): Promise<OwnedDnsRecord | null> {
     const records = await this.listRecords(hostname);
 
-    // No records at all
     if (records.length === 0) return null;
 
+    // Reject mixed sets — the complete result set must be exactly one owned
+    // record for findOwnedRecord to return its ID.
+    const sole = this.soleOwnedRecord(records, slug);
+    if (sole !== null) return { id: sole.id };
+
+    // Multiple owned records
     const owned = this.ownedRecords(records, slug);
-
-    // Exactly one owned match
-    if (owned.length === 1) return { id: owned[0]!.id };
-
-    // Multiple owned matches
     if (owned.length > 1) {
       throw new RouteManagerError(
         'OWNERSHIP_MISMATCH',
@@ -219,7 +256,7 @@ export class CloudflareDnsManager implements DnsManager {
       );
     }
 
-    // Records exist but none are owned
+    // Records exist but none are owned, or they are mixed
     throw new RouteManagerError(
       'DNS_CONFLICT',
       `Hostname ${hostname} has unowned DNS records`,
@@ -228,12 +265,13 @@ export class CloudflareDnsManager implements DnsManager {
 
   async ensureRecord(hostname: string, slug: string): Promise<OwnedDnsRecord> {
     const records = await this.listRecords(hostname);
-    const owned = this.ownedRecords(records, slug);
 
-    // Adopt a single owned record
-    if (owned.length === 1) return { id: owned[0]!.id };
+    // Adopt when the complete set is exactly one owned record
+    const sole = this.soleOwnedRecord(records, slug);
+    if (sole !== null) return { id: sole.id };
 
     // Reject ambiguity
+    const owned = this.ownedRecords(records, slug);
     if (owned.length > 1) {
       throw new RouteManagerError(
         'OWNERSHIP_MISMATCH',
@@ -241,7 +279,7 @@ export class CloudflareDnsManager implements DnsManager {
       );
     }
 
-    // Reject unowned records
+    // Reject any existing records (unowned or mixed)
     if (records.length > 0) {
       throw new RouteManagerError(
         'DNS_CONFLICT',
@@ -250,7 +288,7 @@ export class CloudflareDnsManager implements DnsManager {
     }
 
     // Create new record
-    const created = await this.request<CloudflareDnsRecord>(
+    const resp = await this.request<CloudflareDnsRecord>(
       'POST',
       `/zones/${this.config.zoneId}/dns_records`,
       {
@@ -263,7 +301,7 @@ export class CloudflareDnsManager implements DnsManager {
       },
     );
 
-    return { id: created.id };
+    return { id: resp.result.id };
   }
 
   async deleteRecord(route: RouteRecord, hostname: string): Promise<void> {
@@ -272,7 +310,8 @@ export class CloudflareDnsManager implements DnsManager {
       throw new RouteManagerError('INTERNAL_ERROR', 'No Cloudflare record ID to delete');
     }
 
-    // GET the record by ID — 404 is treated as already-deleted
+    // GET the record by ID — only genuine HTTP 404 is treated as
+    // already-deleted. 400, 403, 405, etc. all propagate as errors.
     const record = await this.fetchRecordById(recordId);
 
     if (record === null) {

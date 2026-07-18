@@ -66,9 +66,28 @@ describe('CloudflareDnsManager', () => {
     await server.destroy();
   });
 
+  // ---------------------------------------------------------------------------
+  // Query capture
+  // ---------------------------------------------------------------------------
+  describe('query capture', () => {
+    it('sends name.exact, page, and per_page query parameters on list', async () => {
+      server.setRecords([ownedRecord('r1')]);
+      await manager.findOwnedRecord(HOSTNAME, SLUG);
+
+      expect(server.calls).toHaveLength(1);
+      const call = server.calls[0]!;
+      expect(call.method).toBe('GET');
+      expect(call.query).toContain('name.exact=my-app.example.com');
+      expect(call.query).toContain('page=1');
+      expect(call.query).toContain('per_page=100');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // assertAvailable
+  // ---------------------------------------------------------------------------
   describe('assertAvailable', () => {
     it('passes when no records exist', async () => {
-      // No initial records — hostname is available
       await expect(manager.assertAvailable(HOSTNAME, SLUG)).resolves.toBeUndefined();
       expect(server.calls).toHaveLength(1);
       expect(server.calls[0]!.method).toBe('GET');
@@ -89,19 +108,38 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
-      // No mutations were made — only list calls
+      // No mutations — only list calls
       expect(server.calls).toHaveLength(2);
       server.calls.forEach(c => expect(c.method).toBe('GET'));
     });
+
+    it('throws DNS_CONFLICT when owned + unowned records coexist', async () => {
+      // One owned and one unowned — the set is mixed
+      server.setRecords([
+        ownedRecord('owned-1'),
+        unownedRecord('r1', 'A', '1.2.3.4'),
+      ]);
+
+      await expect(manager.assertAvailable(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+
+      // No mutations
+      expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
+    });
   });
 
+  // ---------------------------------------------------------------------------
+  // findOwnedRecord
+  // ---------------------------------------------------------------------------
   describe('findOwnedRecord', () => {
     it('returns null when no records exist for hostname', async () => {
       const result = await manager.findOwnedRecord(HOSTNAME, SLUG);
       expect(result).toBeNull();
     });
 
-    it('returns the record ID when one exact owned CNAME exists', async () => {
+    it('returns the record ID when one exact owned CNAME is the sole record', async () => {
       server.setRecords([ownedRecord('owned-1')]);
 
       const result = await manager.findOwnedRecord(HOSTNAME, SLUG);
@@ -123,12 +161,11 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
-      // No DELETE or POST — only GET
       expect(server.calls).toHaveLength(1);
       expect(server.calls[0]!.method).toBe('GET');
     });
 
-    it('throws DNS_CONFLICT for unowned records', async () => {
+    it('throws DNS_CONFLICT when only unowned records exist', async () => {
       server.setRecords([unownedRecord('r1', 'A', '1.2.3.4')]);
 
       await expect(manager.findOwnedRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
@@ -136,23 +173,39 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
+      expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
+    });
+
+    it('rejects mixed owned + unowned records as conflict', async () => {
+      // One owned record coexists with an unowned record — complete result
+      // set is not "exactly one matching owned record"
+      server.setRecords([
+        ownedRecord('owned-1'),
+        unownedRecord('r1', 'A', '1.2.3.4'),
+      ]);
+
+      await expect(manager.findOwnedRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+
       // No mutations
-      expect(server.calls).toHaveLength(1);
-      expect(server.calls[0]!.method).toBe('GET');
+      expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // ensureRecord
+  // ---------------------------------------------------------------------------
   describe('ensureRecord', () => {
-    it('adopts an existing owned CNAME record', async () => {
+    it('adopts an existing owned CNAME record when it is the sole record', async () => {
       server.setRecords([ownedRecord('adopt-me')]);
 
       const result = await manager.ensureRecord(HOSTNAME, SLUG);
       expect(result).toEqual({ id: 'adopt-me' });
 
-      // Only GET — no POST
       expect(server.calls).toHaveLength(1);
-      const calls = server.calls.filter(c => c.method === 'POST');
-      expect(calls).toHaveLength(0);
+      expect(server.calls.filter(c => c.method === 'POST')).toHaveLength(0);
     });
 
     it('creates a new CNAME record when hostname is free', async () => {
@@ -161,7 +214,6 @@ describe('CloudflareDnsManager', () => {
       expect(result.id).toBeTruthy();
       expect(result.id).toMatch(/^fake-cf-/);
 
-      // POST call has correct payload
       const postCalls = server.calls.filter(c => c.method === 'POST');
       expect(postCalls).toHaveLength(1);
       expect(postCalls[0]!.body).toMatchObject({
@@ -169,6 +221,26 @@ describe('CloudflareDnsManager', () => {
         name: HOSTNAME,
         content: CNAME_TARGET,
         proxied: true,
+        ttl: 1,
+        comment: `opencode-route-manager:${SLUG}`,
+      });
+    });
+
+    it('honours configured proxied=false in create payload', async () => {
+      const nonProxyManager = new CloudflareDnsManager(
+        { zoneId: ZONE_ID, apiToken: API_TOKEN, cnameTarget: CNAME_TARGET, proxied: false },
+        { baseUrl: server.url, fetch: globalThis.fetch, timeoutMs: 2000 },
+      );
+
+      await nonProxyManager.ensureRecord(HOSTNAME, SLUG);
+
+      const postCalls = server.calls.filter(c => c.method === 'POST');
+      expect(postCalls).toHaveLength(1);
+      expect(postCalls[0]!.body).toMatchObject({
+        type: 'CNAME',
+        name: HOSTNAME,
+        content: CNAME_TARGET,
+        proxied: false,
         ttl: 1,
         comment: `opencode-route-manager:${SLUG}`,
       });
@@ -185,7 +257,6 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
-      // No POST or DELETE
       expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
     });
 
@@ -197,11 +268,28 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
+      expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
+    });
+
+    it('rejects mixed owned + unowned records as conflict', async () => {
+      server.setRecords([
+        ownedRecord('owned-1'),
+        unownedRecord('r1', 'A', '1.2.3.4'),
+      ]);
+
+      await expect(manager.ensureRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+
       // No POST or DELETE
       expect(server.calls.filter(c => c.method !== 'GET')).toHaveLength(0);
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // deleteRecord
+  // ---------------------------------------------------------------------------
   describe('deleteRecord', () => {
     it('GETs by ID, verifies ownership, then DELETEs', async () => {
       server.setRecords([ownedRecord('cf-record-1')]);
@@ -209,7 +297,6 @@ describe('CloudflareDnsManager', () => {
 
       await manager.deleteRecord(route, HOSTNAME);
 
-      // Should have GET by ID then DELETE
       const getCalls = server.calls.filter(c => c.method === 'GET');
       expect(getCalls).toHaveLength(1);
       expect(getCalls[0]!.path).toContain('/dns_records/cf-record-1');
@@ -219,21 +306,46 @@ describe('CloudflareDnsManager', () => {
       expect(deleteCalls[0]!.path).toContain('/dns_records/cf-record-1');
     });
 
-    it('succeeds idempotently when GET by ID returns 404', async () => {
-      // Record does not exist — GET will 404
+    it('succeeds idempotently when GET by ID returns true 404', async () => {
+      // Record does not exist — server returns genuine 404
       const route = makeRoute({ cloudflareRecordId: 'nonexistent-id' });
 
       await expect(manager.deleteRecord(route, HOSTNAME)).resolves.toBeUndefined();
 
-      // Should have only a GET (which 404ed) — no DELETE
       const getCalls = server.calls.filter(c => c.method === 'GET');
       expect(getCalls).toHaveLength(1);
       expect(getCalls[0]!.path).toContain('/dns_records/nonexistent-id');
       expect(server.calls.filter(c => c.method === 'DELETE')).toHaveLength(0);
     });
 
+    it('rejects non-404 GET-by-ID errors (e.g. 400) and does not DELETE', async () => {
+      // Use setRecordError to make GET-by-ID for this record return 400
+      server.setRecordError('bad-id', 400);
+      const route = makeRoute({ cloudflareRecordId: 'bad-id' });
+
+      await expect(manager.deleteRecord(route, HOSTNAME)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+
+      // GET happened (400 response) but no DELETE
+      expect(server.calls.filter(c => c.method === 'GET')).toHaveLength(1);
+      expect(server.calls.filter(c => c.method === 'DELETE')).toHaveLength(0);
+    });
+
+    it('rejects Auth-adjacent 403 on GET-by-ID', async () => {
+      server.setRecordError('forbidden-id', 403);
+      const route = makeRoute({ cloudflareRecordId: 'forbidden-id' });
+
+      await expect(manager.deleteRecord(route, HOSTNAME)).rejects.toMatchObject({
+        code: 'CONFIGURATION_ERROR',
+        retryable: false,
+      });
+
+      expect(server.calls.filter(c => c.method === 'DELETE')).toHaveLength(0);
+    });
+
     it('throws OWNERSHIP_MISMATCH when target/comment changed and does not DELETE', async () => {
-      // Record exists but with different target
       server.setRecords([{
         id: 'cf-record-1',
         type: 'CNAME',
@@ -250,11 +362,48 @@ describe('CloudflareDnsManager', () => {
         retryable: false,
       });
 
-      // GET happened but no DELETE
       expect(server.calls.filter(c => c.method === 'DELETE')).toHaveLength(0);
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // Pagination
+  // ---------------------------------------------------------------------------
+  describe('pagination', () => {
+    it('fetches multiple pages and aggregates all records', async () => {
+      // 150 unowned records for HOSTNAME: page 1 gets 100, page 2 gets 50.
+      // Pagination must follow result_info.total_pages to reach page 2.
+      const manyRecords: FakeDnsRecord[] = [];
+      for (let i = 0; i < 150; i++) {
+        manyRecords.push(unownedRecord(`p-unowned-${i}`, 'A', `10.0.0.${i}`));
+      }
+      server.setRecords(manyRecords);
+
+      await expect(manager.findOwnedRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+      });
+
+      // Must have fetched both pages
+      expect(server.calls.filter(c => c.method === 'GET').length).toBe(2);
+    });
+
+    it('stops after one page when fewer records than per_page', async () => {
+      // 51 records — all fit on one page (per_page=100)
+      const records: FakeDnsRecord[] = [];
+      for (let i = 0; i < 51; i++) {
+        records.push(unownedRecord(`unowned-${i}`, 'A', `10.0.0.${i}`));
+      }
+      server.setRecords(records);
+
+      await expect(manager.findOwnedRecord(HOSTNAME, SLUG)).rejects.toThrow();
+
+      expect(server.calls.filter(c => c.method === 'GET').length).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Error mapping
+  // ---------------------------------------------------------------------------
   describe('error mapping', () => {
     it('maps 403 to CONFIGURATION_ERROR, retryable=false', async () => {
       server.setNextError(403);
