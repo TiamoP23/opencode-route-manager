@@ -110,7 +110,10 @@ docker build -t opencode-route-manager:test .
 
 # Container smoke test (requires podman or docker on the host)
 # The smoke script needs a working rootless Podman or Docker daemon.
-# In environments without a container runtime, set SKIP_CONTAINER_SMOKE=1:
+# SKIP_CONTAINER_SMOKE=1 permits a clean skip only when no working
+# container runtime is available on the host. If a runtime is present,
+# the environment variable does not prevent the script from attempting
+# to use it — remove the runtime or adjust the check in the script.
 SKIP_CONTAINER_SMOKE=1 bash tests/container-smoke.sh
 ```
 
@@ -127,7 +130,8 @@ npm run dev -- --host 0.0.0.0 --port 5173
 Then publish the route:
 
 ```bash
-node tests/helpers/mcp-smoke-client.mjs publish demo 5173
+MCP_URL=http://route-manager:3000/mcp MCP_TOKEN=<your-mcp-token> \
+  node tests/helpers/mcp-smoke-client.mjs publish demo 5173
 ```
 
 Your app will be proxied through Traefik with the middleware configured by

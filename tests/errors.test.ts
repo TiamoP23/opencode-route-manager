@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { errorResult, RouteManagerError } from '../src/errors.js';
 
+describe('RouteErrorCode', () => {
+  it('INVALID_INPUT is a valid non-retryable code', () => {
+    const err = new RouteManagerError('INVALID_INPUT', 'invalid input');
+    expect(err.code).toBe('INVALID_INPUT');
+    expect(err.retryable).toBe(false);
+  });
+});
+
 describe('errorResult', () => {
   it('preserves RouteManagerError code, message, and retryable', () => {
     const err = new RouteManagerError('ROUTE_NOT_FOUND', 'route xyz not found');

@@ -7,6 +7,7 @@ export type RouteErrorCode =
   | 'PORT_UNREACHABLE'
   | 'ROUTE_LIMIT_REACHED'
   | 'HOSTNAME_RESERVED'
+  | 'INVALID_INPUT'
   | 'ROUTE_ALREADY_EXISTS'
   | 'ROUTE_NOT_FOUND'
   | 'ROUTE_BUSY'
@@ -23,6 +24,7 @@ const retryableMap: Record<RouteErrorCode, boolean> = {
   PORT_UNREACHABLE: true,
   ROUTE_LIMIT_REACHED: false,
   HOSTNAME_RESERVED: false,
+  INVALID_INPUT: false,
   ROUTE_ALREADY_EXISTS: false,
   ROUTE_NOT_FOUND: false,
   ROUTE_BUSY: true,

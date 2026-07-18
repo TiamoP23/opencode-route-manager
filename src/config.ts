@@ -114,6 +114,12 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     };
   }
 
+  const minPort = parseBoundedInt(env, 'MIN_PORT', 1024, 1, 65535);
+  const maxPort = parseBoundedInt(env, 'MAX_PORT', 65535, 1, 65535);
+  if (minPort > maxPort) {
+    throw new Error(`MIN_PORT=${minPort} must not exceed MAX_PORT=${maxPort}`);
+  }
+
   return {
     listenHost: env['LISTEN_HOST'] ?? '0.0.0.0',
     listenPort: parseBoundedInt(env, 'LISTEN_PORT', 3000, 1, 65535),
@@ -121,8 +127,8 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     upstreamHost: env['UPSTREAM_HOST'] ?? 'opencode',
     publicDomain: env['PUBLIC_DOMAIN'] ?? 'tiamop23.de',
     middleware: env['TRAEFIK_MIDDLEWARE'] ?? 'dev-basic-auth@file',
-    minPort: parseBoundedInt(env, 'MIN_PORT', 1024, 1, 65535),
-    maxPort: parseBoundedInt(env, 'MAX_PORT', 65535, 1, 65535),
+    minPort,
+    maxPort,
     deniedPorts: new Set(validatePortSet(parseLowercaseSet(env, 'DENIED_PORTS', '4096'))),
     reservedSlugs: new Set(parseLowercaseSet(env, 'RESERVED_SLUGS', 'opencode,code,auth,traefik,dockge,grafana')),
     maxRoutes: parseBoundedInt(env, 'MAX_ROUTES', 32, 1, 1000),

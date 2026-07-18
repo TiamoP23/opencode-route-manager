@@ -56,6 +56,16 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...required, DENIED_PORTS: '1.5' })).toThrow(/DENIED_PORTS/);
   });
 
+  it('rejects MIN_PORT > MAX_PORT', () => {
+    expect(() => loadConfig({ ...required, MIN_PORT: '30000', MAX_PORT: '20000' })).toThrow(/MIN_PORT.*MAX_PORT/i);
+  });
+
+  it('accepts MIN_PORT === MAX_PORT', () => {
+    const config = loadConfig({ ...required, MIN_PORT: '5000', MAX_PORT: '5000' });
+    expect(config.minPort).toBe(5000);
+    expect(config.maxPort).toBe(5000);
+  });
+
   it('rejects invalid CLOUDFLARE_PROXIED values', () => {
     expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'yes' })).toThrow(/CLOUDFLARE_PROXIED/);
     expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'no' })).toThrow(/CLOUDFLARE_PROXIED/);

@@ -22,19 +22,19 @@ const MAX_DESCRIPTION_LENGTH = 200;
 /**
  * Runtime description validator that rejects non-string types and enforces
  * the maximum length. Accepts null and undefined (which clear the field).
- * Throws RouteManagerError with INVALID_SLUG on failure.
+ * Throws RouteManagerError with INVALID_INPUT on failure.
  */
 function validateDescription(value: unknown): void {
   if (value === null || value === undefined) return;
   if (typeof value !== 'string') {
     throw new RouteManagerError(
-      'INVALID_SLUG',
+      'INVALID_INPUT',
       'description must be a string',
     );
   }
   if (value.length > MAX_DESCRIPTION_LENGTH) {
     throw new RouteManagerError(
-      'INVALID_SLUG',
+      'INVALID_INPUT',
       `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`,
     );
   }
@@ -188,6 +188,14 @@ export class RouteService {
     validateDescription(input.description);
     if (input.port !== undefined) {
       validatePort(input.port, this.config);
+    }
+
+    // Reject no-op: at least one of port or description must be provided
+    if (input.port === undefined && input.description === undefined) {
+      throw new RouteManagerError(
+        'INVALID_INPUT',
+        'at least one of port or description must be provided',
+      );
     }
 
     return this.slugLock.run(input.slug, async () => {
@@ -398,8 +406,20 @@ export class RouteService {
           });
         }
       } catch {
-        // Internal handlers (e.g. performDnsCleanup) already persisted
-        // the error. Swallow so later rows continue processing.
+        // Unexpected outer failure — best-effort persist INTERNAL_ERROR
+        // so the failure is visible, but INTERNAL_ERROR is not in the
+        // auto-retry set so later reconciliation requires operator action.
+        const code = 'INTERNAL_ERROR';
+        try {
+          await this.store.recordError(row.slug, { code, message: 'An internal error occurred' });
+        } catch { /* persistence failure must not prevent later rows */ }
+        try {
+          this.onReconcileEvent?.({
+            slug: row.slug,
+            status: row.status as 'creating' | 'deleting',
+            code,
+          });
+        } catch { /* event emission failure must not prevent later rows */ }
       }
     }
   }

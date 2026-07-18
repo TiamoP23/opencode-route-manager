@@ -555,6 +555,36 @@ describe('MCP tools', () => {
     expect(callResult.structuredContent).toEqual(body);
   });
 
+  it('update_service rejects empty update (neither port nor description) with MCP validation error', async () => {
+    await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'empty-upd', port: 3000 },
+    });
+
+    const callResult = await client.callTool({
+      name: 'update_service',
+      arguments: { slug: 'empty-upd' },
+    }) as CallResult;
+
+    // The Zod refine rejects at the MCP schema level before reaching
+    // our handler — isError is true with a human-readable message.
+    expect(callResult.isError).toBe(true);
+    const text = callResult.content[0]!.text;
+    expect(text).toContain('MCP error');
+    expect(text).toContain('At least one');
+  });
+
+  it('update_service input JSON Schema preserves object shape after refine', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'update_service')!;
+    const schema = tool.inputSchema as JsonSchema;
+
+    // Schema must still be an object with the expected properties
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['slug', 'port', 'description']);
+    expect(schema.required).toEqual(['slug']);
+  });
+
   // -----------------------------------------------------------------------
   // remove_service — success
   // -----------------------------------------------------------------------

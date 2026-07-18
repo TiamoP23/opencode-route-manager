@@ -684,6 +684,24 @@ describe('RouteService', () => {
       const row = await store.get('pfail');
       expect(row!.port).toBe(3000);
     });
+
+    it('rejects empty update with neither port nor description using INVALID_INPUT', async () => {
+      await svc.publish({ slug: 'empty-upd', port: 3000, description: 'test' });
+      log.clear();
+
+      let error: unknown;
+      try {
+        await svc.update({ slug: 'empty-upd' });
+      } catch (e: unknown) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(RouteManagerError);
+      expect((error as RouteManagerError).code).toBe('INVALID_INPUT');
+      expect((error as RouteManagerError).retryable).toBe(false);
+
+      // No store mutations should have occurred
+      expect(log.entries.length).toBe(0);
+    });
   });
 
   // ----------------------------------------------------------------
@@ -1185,6 +1203,97 @@ describe('RouteService', () => {
       expect(current!.status).toBe('creating');
       // No probe, DNS, or activate from the reconciler
       expect(log.significant()).toEqual(['store.listPending']);
+    });
+
+    it('reconcile outer catch persists INTERNAL_ERROR and continues to next row', async () => {
+      vi.useFakeTimers();
+
+      // Track reconciliation events
+      const events: Array<{ slug: string; status: string; code: string }> = [];
+      const eventSvc = new RouteService({
+        config: config(),
+        store,
+        dns,
+        probe: loggedProbe(true, log),
+        onReconcileEvent: (evt) => { events.push(evt); },
+      });
+
+      // First row: creating, slug lock will throw unexpectedly
+      await store.insertCreating({ slug: 'outer-catch-1', port: 3000, description: null });
+      // Second row: creating, should succeed
+      await store.insertCreating({ slug: 'outer-catch-2', port: 3001, description: null });
+      dns._addRecord('outer-catch-2.tiamop23.de', 'outer-catch-2', 'cf-2');
+
+      vi.advanceTimersByTime(10_000);
+
+      // Make the first row's slugLock.run throw unexpectedly
+      const slugLock = (eventSvc as unknown as { slugLock: KeyedLock }).slugLock;
+      const origRun = slugLock.run.bind(slugLock);
+      let firstCall = true;
+      slugLock.run = ((key: string, operation: () => Promise<unknown>) => {
+        if (key === 'outer-catch-1' && firstCall) {
+          firstCall = false;
+          throw new Error('unexpected lock error');
+        }
+        return origRun(key, operation);
+      }) as typeof slugLock.run;
+
+      log.clear();
+      await eventSvc.reconcilePending();
+
+      // First row: INTERNAL_ERROR persisted
+      const row1 = await store.get('outer-catch-1');
+      expect(row1).not.toBeNull();
+      expect(row1!.lastErrorCode).toBe('INTERNAL_ERROR');
+      expect(row1!.retryCount).toBeGreaterThanOrEqual(1);
+
+      // Second row: successfully activated
+      const row2 = await store.get('outer-catch-2');
+      expect(row2).not.toBeNull();
+      expect(row2!.status).toBe('active');
+
+      // Reconciliation event emitted for the outer catch
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0]!.slug).toBe('outer-catch-1');
+      expect(events[0]!.code).toBe('INTERNAL_ERROR');
+    });
+
+    it('reconcile outer catch recordError failure does not prevent later rows', async () => {
+      vi.useFakeTimers();
+
+      // First row: creating, slug lock throws; store.recordError also throws
+      await store.insertCreating({ slug: 'double-fail', port: 3000, description: null });
+      // Second row: creating, should succeed
+      await store.insertCreating({ slug: 'double-ok', port: 3001, description: null });
+      dns._addRecord('double-ok.tiamop23.de', 'double-ok', 'cf-ok');
+
+      vi.advanceTimersByTime(10_000);
+
+      // Make slugLock.run throw for first row
+      const slugLock = (svc as unknown as { slugLock: KeyedLock }).slugLock;
+      const origRun = slugLock.run.bind(slugLock);
+      let firstCall = true;
+      slugLock.run = ((key: string, operation: () => Promise<unknown>) => {
+        if (key === 'double-fail' && firstCall) {
+          firstCall = false;
+          throw new Error('lock error');
+        }
+        return origRun(key, operation);
+      }) as typeof slugLock.run;
+
+      // Make recordError throw for any slug
+      const origRecordError = store.recordError.bind(store);
+      store.recordError = async () => {
+        throw new Error('persistence failure');
+      };
+
+      log.clear();
+      await svc.reconcilePending();
+
+      // Second row should still be processed even after first row's double failure
+      const row2 = await store.get('double-ok');
+      expect(row2).not.toBeNull();
+      expect(row2!.status).toBe('active');
     });
 
     it('reconcile isolating deleting cleanup failures across rows', async () => {

@@ -17,6 +17,7 @@ const MCP_ERROR_MESSAGES: Record<string, string> = {
   PORT_UNREACHABLE: 'The target port is not reachable. Please retry.',
   ROUTE_LIMIT_REACHED: 'The maximum number of routes has been reached.',
   HOSTNAME_RESERVED: 'The provided slug is reserved.',
+  INVALID_INPUT: 'The provided input is invalid.',
   ROUTE_ALREADY_EXISTS: 'A route with this slug already exists.',
   ROUTE_NOT_FOUND: 'The requested route was not found.',
   ROUTE_BUSY: 'The route is currently busy. Please retry.',
@@ -37,6 +38,20 @@ const DEFAULT_INTERNAL_MSG: string = MCP_ERROR_MESSAGES.INTERNAL_ERROR!;
 const slug = z.string().min(1).max(63);
 const portIn = z.number().int().min(1).max(65535);
 const descriptionIn = z.string().max(200).nullable();
+
+/**
+ * Update input schema refined to require at least one of port or description.
+ * Zod 4.4.3 refine() retains _zod.def.type === 'object' and its shape,
+ * so MCP SDK 1.29.0 recognizes it and preserves generated field schemas.
+ */
+const updateInput = z.object({
+  slug,
+  port: portIn.optional(),
+  description: descriptionIn.optional(),
+}).refine(
+  (data) => data.port !== undefined || data.description !== undefined,
+  { message: 'At least one of port or description must be provided' },
+);
 
 const routeOutput = z.object({
   slug: z.string(),
@@ -231,11 +246,7 @@ export function createMcpServer(service: RouteService): McpServer {
       title: 'Update Service',
       description:
         'Update an existing service route. Accepts partial updates for port and description.',
-      inputSchema: {
-        slug,
-        port: portIn.optional(),
-        description: descriptionIn.optional(),
-      },
+      inputSchema: updateInput,
       outputSchema: updateOutput,
       annotations: UPDATE_ANNOTATIONS,
     },
