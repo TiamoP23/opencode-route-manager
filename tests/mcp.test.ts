@@ -10,6 +10,27 @@ import { createMcpServer } from '../src/mcp.js';
 import * as z from 'zod/v4';
 
 // ---------------------------------------------------------------------------
+// Types for structured schema assertions
+// ---------------------------------------------------------------------------
+
+/** JSON Schema representation as returned by MCP listTools. */
+interface JsonSchema {
+  type?: string;
+  properties?: Record<string, unknown>;
+  required?: string[];
+  items?: JsonSchema;
+  anyOf?: JsonSchema[];
+  enum?: string[];
+  format?: string;
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  additionalProperties?: boolean;
+  $schema?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Fake RouteStore — minimal in-memory implementation
 // ---------------------------------------------------------------------------
 
@@ -278,38 +299,189 @@ describe('MCP tools', () => {
     }
   });
 
-  it('publish_service input schema defines slug, port, description', async () => {
+  // -----------------------------------------------------------------------
+  // Full JSON Schema contracts from listTools()
+  // -----------------------------------------------------------------------
+
+  it('publish_service input JSON Schema is exact', async () => {
     const result = await client.listTools();
-    const pub = result.tools.find((t) => t.name === 'publish_service')!;
-    expect(pub.inputSchema).toBeDefined();
-    const props = (pub.inputSchema as Record<string, any>).properties ?? {};
+    const tool = result.tools.find((t) => t.name === 'publish_service')!;
+    const schema = tool.inputSchema as JsonSchema;
 
-    // slug: string, minLength 1, maxLength 63
-    expect(props.slug).toBeDefined();
-    expect(props.slug.type).toBe('string');
-    expect(props.slug.minLength).toBe(1);
-    expect(props.slug.maxLength).toBe(63);
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['slug', 'port', 'description']);
+    expect(schema.required).toEqual(['slug', 'port']);
 
-    // port: integer, min 1, max 65535
-    expect(props.port).toBeDefined();
-    expect(props.port.type).toBe('integer');
-    expect(props.port.minimum).toBe(1);
-    expect(props.port.maximum).toBe(65535);
+    const slug = schema.properties!.slug as JsonSchema;
+    expect(slug.type).toBe('string');
+    expect(slug.minLength).toBe(1);
+    expect(slug.maxLength).toBe(63);
 
-    // description: string, nullable, maxLength 200
-    // Nullable strings are encoded as anyOf: [{ type: 'string', maxLength: 200 }, { type: 'null' }]
-    expect(props.description).toBeDefined();
-    expect(props.description.anyOf).toBeDefined();
-    const stringPart = props.description.anyOf.find((s: Record<string, unknown>) => s.type === 'string');
-    expect(stringPart).toBeDefined();
-    expect(stringPart.maxLength).toBe(200);
+    const port = schema.properties!.port as JsonSchema;
+    expect(port.type).toBe('integer');
+    expect(port.minimum).toBe(1);
+    expect(port.maximum).toBe(65535);
+
+    const desc = schema.properties!.description as JsonSchema;
+    const descAnyOf = desc.anyOf!;
+    expect(descAnyOf).toHaveLength(2);
+    const strPart = descAnyOf.find((s) => s.type === 'string')!;
+    expect(strPart.maxLength).toBe(200);
+    const nullPart = descAnyOf.find((s) => s.type === 'null')!;
+    expect(nullPart).toBeDefined();
   });
 
-  it('list_services has no required input properties', async () => {
+  it('publish_service output JSON Schema contains RouteOutput with status enum, format date-time, full required, nullable shapes', async () => {
     const result = await client.listTools();
-    const svc = result.tools.find((t) => t.name === 'list_services')!;
-    const props = (svc.inputSchema as Record<string, any>)?.properties ?? {};
-    expect(Object.keys(props)).toHaveLength(0);
+    const tool = result.tools.find((t) => t.name === 'publish_service')!;
+    const schema = tool.outputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['service', 'url']);
+    expect(schema.required).toEqual(['service', 'url']);
+
+    // RouteOutput shape inside service
+    const svc = schema.properties!.service as JsonSchema;
+    expect(svc.type).toBe('object');
+    expect(svc.additionalProperties).toBe(false);
+
+    const svcProps = svc.properties!;
+    expect(Object.keys(svcProps)).toEqual([
+      'slug', 'port', 'description', 'status',
+      'dnsRecordId', 'error', 'createdAt', 'updatedAt',
+    ]);
+    expect(svc.required).toEqual([
+      'slug', 'port', 'description', 'status',
+      'dnsRecordId', 'error', 'createdAt', 'updatedAt',
+    ]);
+
+    // Status is an enum
+    const status = svcProps.status as JsonSchema;
+    expect(status.enum).toEqual(['creating', 'active', 'deleting']);
+
+    // Timestamps have format: date-time
+    const createdAt = svcProps.createdAt as JsonSchema;
+    expect(createdAt.type).toBe('string');
+    expect(createdAt.format).toBe('date-time');
+
+    const updatedAt = svcProps.updatedAt as JsonSchema;
+    expect(updatedAt.type).toBe('string');
+    expect(updatedAt.format).toBe('date-time');
+
+    // Nullable description (anyOf with null)
+    const descAnyOf = (svcProps.description as JsonSchema).anyOf!;
+    expect(descAnyOf).toHaveLength(2);
+    expect(descAnyOf.find((s) => s.type === 'string')).toBeDefined();
+    expect(descAnyOf.find((s) => s.type === 'null')).toBeDefined();
+
+    // Nullable dnsRecordId
+    const dnsAnyOf = (svcProps.dnsRecordId as JsonSchema).anyOf!;
+    expect(dnsAnyOf).toHaveLength(2);
+    expect(dnsAnyOf.find((s) => s.type === 'string')).toBeDefined();
+    expect(dnsAnyOf.find((s) => s.type === 'null')).toBeDefined();
+
+    // Nullable error with nested object
+    const errorAnyOf = (svcProps.error as JsonSchema).anyOf!;
+    expect(errorAnyOf).toHaveLength(2);
+    const errorObj = errorAnyOf.find((s) => s.type === 'object')!;
+    expect(errorObj.properties).toBeDefined();
+    expect(Object.keys(errorObj.properties!)).toEqual(['code', 'message']);
+    expect(errorObj.required).toEqual(['code', 'message']);
+    expect(errorObj.additionalProperties).toBe(false);
+    expect(errorAnyOf.find((s) => s.type === 'null')).toBeDefined();
+  });
+
+  it('update_service input JSON Schema has slug required, port and description optional', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'update_service')!;
+    const schema = tool.inputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['slug', 'port', 'description']);
+    expect(schema.required).toEqual(['slug']);
+  });
+
+  it('update_service output JSON Schema matches publish_service output', async () => {
+    const result = await client.listTools();
+    const pub = result.tools.find((t) => t.name === 'publish_service')!;
+    const upd = result.tools.find((t) => t.name === 'update_service')!;
+    // Identical output shape
+    expect(upd.outputSchema).toEqual(pub.outputSchema);
+  });
+
+  it('remove_service input JSON Schema has only slug required', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'remove_service')!;
+    const schema = tool.inputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['slug']);
+
+    const slug = schema.properties!.slug as JsonSchema;
+    expect(slug.type).toBe('string');
+    expect(slug.minLength).toBe(1);
+    expect(slug.maxLength).toBe(63);
+    expect(schema.required).toEqual(['slug']);
+  });
+
+  it('remove_service output JSON Schema has slug and removed boolean', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'remove_service')!;
+    const schema = tool.outputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['slug', 'removed']);
+    expect(schema.required).toEqual(['slug', 'removed']);
+    const removed = schema.properties!.removed as JsonSchema;
+    expect(removed.type).toBe('boolean');
+  });
+
+  it('list_services input JSON Schema has no properties', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'list_services')!;
+    const schema = tool.inputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual([]);
+    expect(schema.required).toBeUndefined();
+  });
+
+  it('list_services output JSON Schema has services array containing RouteOutput', async () => {
+    const result = await client.listTools();
+    const tool = result.tools.find((t) => t.name === 'list_services')!;
+    const schema = tool.outputSchema as JsonSchema;
+
+    expect(schema.type).toBe('object');
+    expect(Object.keys(schema.properties ?? {})).toEqual(['services']);
+    expect(schema.required).toEqual(['services']);
+
+    const services = schema.properties!.services as JsonSchema;
+    expect(services.type).toBe('array');
+    expect(services.items).toBeDefined();
+
+    // The items should match the RouteOutput shape (deep schema check)
+    const item = services.items!;
+    expect(item.type).toBe('object');
+    expect(item.additionalProperties).toBe(false);
+
+    const itemProps = item.properties!;
+    expect(Object.keys(itemProps)).toEqual([
+      'slug', 'port', 'description', 'status',
+      'dnsRecordId', 'error', 'createdAt', 'updatedAt',
+    ]);
+    expect(item.required).toEqual([
+      'slug', 'port', 'description', 'status',
+      'dnsRecordId', 'error', 'createdAt', 'updatedAt',
+    ]);
+
+    const status = itemProps.status as JsonSchema;
+    expect(status.enum).toEqual(['creating', 'active', 'deleting']);
+
+    const createdAt = itemProps.createdAt as JsonSchema;
+    expect(createdAt.format).toBe('date-time');
+
+    const updatedAt = itemProps.updatedAt as JsonSchema;
+    expect(updatedAt.format).toBe('date-time');
   });
 
   // -----------------------------------------------------------------------
@@ -783,6 +955,93 @@ describe('MCP tools', () => {
     expect(svc.error).toEqual({
       code: 'INTERNAL_ERROR',
       message: 'An internal error occurred.',
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Inherited-key protection — Object.hasOwn vs  in (prototype pollution)
+  // -----------------------------------------------------------------------
+
+  it('maps persisted "constructor" error code to INTERNAL_ERROR', async () => {
+    const now = new Date();
+    const route: RouteRecord = {
+      slug: 'ctor-route', port: 3000, description: null,
+      status: 'active', cloudflareRecordId: null,
+      lastErrorCode: 'constructor',
+      lastErrorMessage: 'sensitive detail',
+      retryCount: 1, createdAt: now, updatedAt: now,
+    };
+    (store as unknown as { data: Map<string, RouteRecord> }).data.set('ctor-route', route);
+
+    const result = await client.callTool({ name: 'list_services', arguments: {} }) as CallResult;
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body.services[0].error).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'An internal error occurred.',
+    });
+  });
+
+  it('maps persisted "toString" error code to INTERNAL_ERROR', async () => {
+    const now = new Date();
+    const route: RouteRecord = {
+      slug: 'tostr-route', port: 3000, description: null,
+      status: 'active', cloudflareRecordId: null,
+      lastErrorCode: 'toString',
+      lastErrorMessage: 'sensitive detail',
+      retryCount: 1, createdAt: now, updatedAt: now,
+    };
+    (store as unknown as { data: Map<string, RouteRecord> }).data.set('tostr-route', route);
+
+    const result = await client.callTool({ name: 'list_services', arguments: {} }) as CallResult;
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body.services[0].error).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'An internal error occurred.',
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Inherited-key: thrown RouteManagerError
+  // -----------------------------------------------------------------------
+
+  it('maps thrown RouteManagerError with "constructor" code to INTERNAL_ERROR', async () => {
+    class ConstructorThrowingStore extends FakeRouteStore {
+      override async insertCreating(
+        _input: { slug: string; port: number; description: string | null },
+      ): Promise<RouteRecord> {
+        throw new RouteManagerError('constructor' as any, 'deliberate ctor error');
+      }
+    }
+
+    const throwingService = new RouteService({
+      config: testConfig(),
+      store: new ConstructorThrowingStore(),
+      dns: null,
+      probe: async () => true,
+    });
+
+    const mcpServer = createMcpServer(throwingService);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const throwingClient = new Client(
+      { name: 'test-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    await Promise.all([
+      throwingClient.connect(ct),
+      mcpServer.connect(st),
+    ]);
+
+    const result = await throwingClient.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'ctor-thrown', port: 3000 },
+    }) as CallResult;
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body.error).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'An internal error occurred.',
+      retryable: true,
     });
   });
 });

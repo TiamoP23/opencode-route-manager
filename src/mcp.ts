@@ -87,11 +87,11 @@ function toRouteOutput(record: RouteRecord) {
     error: record.lastErrorCode
       ? {
           code:
-            record.lastErrorCode in MCP_ERROR_MESSAGES
+            Object.hasOwn(MCP_ERROR_MESSAGES, record.lastErrorCode)
               ? record.lastErrorCode
               : DEFAULT_INTERNAL_CODE,
           message:
-            record.lastErrorCode in MCP_ERROR_MESSAGES
+            Object.hasOwn(MCP_ERROR_MESSAGES, record.lastErrorCode)
               ? MCP_ERROR_MESSAGES[record.lastErrorCode]!
               : DEFAULT_INTERNAL_MSG,
         }
@@ -131,14 +131,15 @@ async function toToolResult<T>(operation: () => Promise<T>): Promise<ToolSuccess
     };
   } catch (err) {
     const isRouteError = err instanceof RouteManagerError;
-    const errCode: RouteErrorCode = isRouteError
-      ? err.code
+    const rawCode: RouteErrorCode = isRouteError ? err.code : DEFAULT_INTERNAL_CODE;
+    const errCode: RouteErrorCode = Object.hasOwn(MCP_ERROR_MESSAGES, rawCode)
+      ? rawCode
       : DEFAULT_INTERNAL_CODE;
     const message: string =
-      errCode in MCP_ERROR_MESSAGES
+      Object.hasOwn(MCP_ERROR_MESSAGES, errCode)
         ? MCP_ERROR_MESSAGES[errCode]!
         : DEFAULT_INTERNAL_MSG;
-    const retryable = isRouteError ? err.retryable : true;
+    const retryable = isRouteError && errCode === rawCode ? err.retryable : true;
 
     const errorPayload = { code: errCode, message, retryable };
 
