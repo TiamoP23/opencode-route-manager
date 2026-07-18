@@ -1,10 +1,33 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
-import type { RouteRecord } from './domain.js';
-import type { PublishInput, UpdateInput } from './domain.js';
+import type { PublishInput, RouteRecord, UpdateInput } from './domain.js';
 import type { RouteService } from './route-service.js';
-import { RouteManagerError } from './errors.js';
+import type { RouteErrorCode } from './errors.js';
+
+// ---------------------------------------------------------------------------
+// Fixed MCP-safe error messages — no host/domain/record/config/stack leakage
+// ---------------------------------------------------------------------------
+
+const MCP_ERROR_MESSAGES: Record<string, string> = {
+  INVALID_SLUG: 'The provided slug is invalid.',
+  INVALID_PORT: 'The provided port is invalid or out of range.',
+  PORT_DENIED: 'The provided port is not allowed.',
+  PORT_UNREACHABLE: 'The target port is not reachable. Please retry.',
+  ROUTE_LIMIT_REACHED: 'The maximum number of routes has been reached.',
+  HOSTNAME_RESERVED: 'The provided slug is reserved.',
+  ROUTE_ALREADY_EXISTS: 'A route with this slug already exists.',
+  ROUTE_NOT_FOUND: 'The requested route was not found.',
+  ROUTE_BUSY: 'The route is currently busy. Please retry.',
+  DNS_UNAVAILABLE: 'DNS service is currently unavailable. Please retry.',
+  DNS_CONFLICT: 'A DNS conflict was detected.',
+  OWNERSHIP_MISMATCH: 'Ownership validation failed.',
+  CONFIGURATION_ERROR: 'The server is misconfigured.',
+  INTERNAL_ERROR: 'An internal error occurred.',
+};
+
+const DEFAULT_INTERNAL_CODE = 'INTERNAL_ERROR' as const;
+const DEFAULT_INTERNAL_MSG: string = MCP_ERROR_MESSAGES.INTERNAL_ERROR!;
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -18,7 +41,7 @@ const routeOutput = z.object({
   slug: z.string(),
   port: z.number().int(),
   description: z.string().nullable(),
-  status: z.string(),
+  status: z.enum(['creating', 'active', 'deleting']),
   dnsRecordId: z.string().nullable(),
   error: z
     .object({
@@ -68,26 +91,56 @@ function toRouteOutput(record: RouteRecord) {
   };
 }
 
-function successResult(output: Record<string, unknown>) {
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify(output) }],
-    structuredContent: output,
-  };
-}
+/** Shape returned by MCP on success for any tool that returns JSON output. */
+type ToolSuccess<T> = {
+  content: [{ type: 'text'; text: string }];
+  structuredContent: T;
+};
 
-function errorResultContent(error: unknown) {
-  const err =
-    error instanceof RouteManagerError
-      ? { code: error.code, message: error.message, retryable: error.retryable }
-      : {
-          code: 'INTERNAL_ERROR' as const,
-          message: 'An internal error occurred',
-          retryable: true,
-        };
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify({ error: err }) }],
-    isError: true as const,
-  };
+/** Shape returned by MCP on error for any tool. */
+type ToolFailure = {
+  content: [{ type: 'text'; text: string }];
+  structuredContent: { error: { code: string; message: string; retryable: boolean } };
+  isError: true;
+};
+
+/**
+ * Wrap a service operation and convert its result into a consistent
+ * MCP CallToolResult with proper success/error handling.
+ *
+ * - On success: JSON text + structuredContent matching the output
+ * - On RouteManagerError: fixed MCP-safe message + structured error content
+ * - On unknown errors: INTERNAL_ERROR with retryable=true
+ */
+async function toToolResult<T>(operation: () => Promise<T>): Promise<ToolSuccess<T> | ToolFailure> {
+  try {
+    const output = await operation();
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(output) }],
+      structuredContent: output,
+    };
+  } catch (err) {
+    const isRouteError = err instanceof Error && 'code' in err && typeof (err as { code: unknown }).code === 'string';
+    const errCode: RouteErrorCode = isRouteError
+      ? (err as { code: RouteErrorCode }).code
+      : DEFAULT_INTERNAL_CODE;
+    const message: string =
+      errCode in MCP_ERROR_MESSAGES
+        ? MCP_ERROR_MESSAGES[errCode]!
+        : DEFAULT_INTERNAL_MSG;
+    const retryable =
+      err instanceof Error && 'retryable' in err
+        ? (err as { retryable: boolean }).retryable
+        : true;
+
+    const errorPayload = { code: errCode, message, retryable };
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: errorPayload }) }],
+      structuredContent: { error: errorPayload },
+      isError: true as const,
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,19 +206,14 @@ export function createMcpServer(service: RouteService): McpServer {
       outputSchema: publishOutput,
       annotations: PUBLISH_ANNOTATIONS,
     },
-    async (args) => {
-      try {
+    (args) =>
+      toToolResult(async () => {
         const record = await service.publish(args as PublishInput);
-        const domain = (service as any).config.publicDomain;
-        const url = `https://${record.slug}.${domain}`;
-        return successResult({
+        return {
           service: toRouteOutput(record),
-          url,
-        } as z.infer<typeof publishOutput>);
-      } catch (err) {
-        return errorResultContent(err);
-      }
-    },
+          url: service.publicUrl(record.slug),
+        };
+      }),
   );
 
   // ---- update_service ----
@@ -183,19 +231,14 @@ export function createMcpServer(service: RouteService): McpServer {
       outputSchema: updateOutput,
       annotations: UPDATE_ANNOTATIONS,
     },
-    async (args) => {
-      try {
+    (args) =>
+      toToolResult(async () => {
         const record = await service.update(args as UpdateInput);
-        const domain = (service as any).config.publicDomain;
-        const url = `https://${record.slug}.${domain}`;
-        return successResult({
+        return {
           service: toRouteOutput(record),
-          url,
-        } as z.infer<typeof updateOutput>);
-      } catch (err) {
-        return errorResultContent(err);
-      }
-    },
+          url: service.publicUrl(record.slug),
+        };
+      }),
   );
 
   // ---- remove_service ----
@@ -209,14 +252,11 @@ export function createMcpServer(service: RouteService): McpServer {
       outputSchema: removeOutput,
       annotations: REMOVE_ANNOTATIONS,
     },
-    async (args) => {
-      try {
+    (args) =>
+      toToolResult(async () => {
         const result = await service.remove(args.slug);
-        return successResult(result as z.infer<typeof removeOutput>);
-      } catch (err) {
-        return errorResultContent(err);
-      }
-    },
+        return result;
+      }),
   );
 
   // ---- list_services ----
@@ -229,16 +269,11 @@ export function createMcpServer(service: RouteService): McpServer {
       outputSchema: listOutput,
       annotations: LIST_ANNOTATIONS,
     },
-    async () => {
-      try {
+    () =>
+      toToolResult(async () => {
         const records = await service.list();
-        return successResult({
-          services: records.map(toRouteOutput),
-        } as z.infer<typeof listOutput>);
-      } catch (err) {
-        return errorResultContent(err);
-      }
-    },
+        return { services: records.map(toRouteOutput) };
+      }),
   );
 
   return server;

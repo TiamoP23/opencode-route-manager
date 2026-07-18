@@ -1227,4 +1227,20 @@ describe('RouteService', () => {
       expect(goodRow).toBeNull();
     });
   });
+
+  // -----------------------------------------------------------------------
+  // publicUrl
+  // -----------------------------------------------------------------------
+
+  describe('publicUrl', () => {
+    it('returns the full https URL for a given slug', () => {
+      const url = svc.publicUrl('my-app');
+      expect(url).toBe('https://my-app.tiamop23.de');
+    });
+
+    it('includes the configured publicDomain', () => {
+      const url = svc.publicUrl('test');
+      expect(url).toMatch(/^https:\/\/test\.tiamop23\.de$/);
+    });
+  });
 });

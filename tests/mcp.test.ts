@@ -211,6 +211,9 @@ interface CallResult {
   structuredContent?: Record<string, unknown>;
 }
 
+// ISO-8601 full datetime regex
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -265,30 +268,46 @@ describe('MCP tools', () => {
     }
   });
 
-  it('annotations match expected hints', async () => {
+  it('annotations match expected hints exactly', async () => {
     const result = await client.listTools();
     for (const tool of result.tools) {
       const expected = EXPECTED_ANNOTATIONS[tool.name];
       expect(expected).toBeDefined();
-      expect(tool.annotations!).toMatchObject(expected as Record<string, unknown>);
+      expect(tool.annotations!).toEqual(expected);
     }
   });
 
-  it('publish_service input schema accepts slug, port, description', async () => {
+  it('publish_service input schema defines slug, port, description', async () => {
     const result = await client.listTools();
     const pub = result.tools.find((t) => t.name === 'publish_service')!;
     expect(pub.inputSchema).toBeDefined();
-    const props = (pub.inputSchema as any).properties ?? {};
+    const props = (pub.inputSchema as Record<string, any>).properties ?? {};
+
+    // slug: string, minLength 1, maxLength 63
     expect(props.slug).toBeDefined();
+    expect(props.slug.type).toBe('string');
+    expect(props.slug.minLength).toBe(1);
+    expect(props.slug.maxLength).toBe(63);
+
+    // port: integer, min 1, max 65535
     expect(props.port).toBeDefined();
+    expect(props.port.type).toBe('integer');
+    expect(props.port.minimum).toBe(1);
+    expect(props.port.maximum).toBe(65535);
+
+    // description: string, nullable, maxLength 200
+    // Nullable strings are encoded as anyOf: [{ type: 'string', maxLength: 200 }, { type: 'null' }]
     expect(props.description).toBeDefined();
+    expect(props.description.anyOf).toBeDefined();
+    const stringPart = props.description.anyOf.find((s: Record<string, unknown>) => s.type === 'string');
+    expect(stringPart).toBeDefined();
+    expect(stringPart.maxLength).toBe(200);
   });
 
   it('list_services has no required input properties', async () => {
     const result = await client.listTools();
     const svc = result.tools.find((t) => t.name === 'list_services')!;
-    // inputSchema may be an empty object or absent
-    const props = (svc.inputSchema as any)?.properties ?? {};
+    const props = (svc.inputSchema as Record<string, any>)?.properties ?? {};
     expect(Object.keys(props)).toHaveLength(0);
   });
 
@@ -315,11 +334,15 @@ describe('MCP tools', () => {
     expect(body.service.port).toBe(3000);
     expect(body.service.description).toBe('Test app');
     expect(body.service.status).toBe('active');
+    expect(body.service.dnsRecordId).toBeNull();
+    expect(body.service.error).toBeNull();
+    expect(body.service.createdAt).toMatch(ISO_RE);
+    expect(body.service.updatedAt).toMatch(ISO_RE);
     expect(body.url).toBe('https://my-app.test.dev');
 
     // structuredContent matches body
     expect(callResult.structuredContent).toBeDefined();
-    expect(callResult.structuredContent).toMatchObject(body);
+    expect(callResult.structuredContent).toEqual(body);
   });
 
   it('publish_service accepts nullable description', async () => {
@@ -337,7 +360,6 @@ describe('MCP tools', () => {
   // -----------------------------------------------------------------------
 
   it('update_service returns updated service and url', async () => {
-    // First publish a route
     await client.callTool({
       name: 'publish_service',
       arguments: { slug: 'my-app', port: 3000 },
@@ -353,9 +375,11 @@ describe('MCP tools', () => {
     expect(body.service.port).toBe(4000);
     expect(body.service.description).toBe('Updated');
     expect(body.service.status).toBe('active');
+    expect(body.service.createdAt).toMatch(ISO_RE);
+    expect(body.service.updatedAt).toMatch(ISO_RE);
     expect(body.url).toBe('https://my-app.test.dev');
 
-    expect(callResult.structuredContent).toMatchObject(body);
+    expect(callResult.structuredContent).toEqual(body);
   });
 
   // -----------------------------------------------------------------------
@@ -376,7 +400,7 @@ describe('MCP tools', () => {
     expect(callResult.isError).toBeUndefined();
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body).toEqual({ slug: 'my-app', removed: true });
-    expect(callResult.structuredContent).toMatchObject(body);
+    expect(callResult.structuredContent).toEqual(body);
   });
 
   it('remove_service returns removed=false for non-existent route', async () => {
@@ -388,7 +412,7 @@ describe('MCP tools', () => {
     expect(callResult.isError).toBeUndefined();
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body).toEqual({ slug: 'ghost', removed: false });
-    expect(callResult.structuredContent).toMatchObject(body);
+    expect(callResult.structuredContent).toEqual(body);
   });
 
   // -----------------------------------------------------------------------
@@ -404,10 +428,10 @@ describe('MCP tools', () => {
     expect(callResult.isError).toBeUndefined();
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body.services).toEqual([]);
-    expect(callResult.structuredContent).toMatchObject(body);
+    expect(callResult.structuredContent).toEqual(body);
   });
 
-  it('list_services returns all published routes', async () => {
+  it('list_services returns all published routes with status and ISO dates', async () => {
     await client.callTool({
       name: 'publish_service',
       arguments: { slug: 'app-one', port: 3001 },
@@ -424,19 +448,27 @@ describe('MCP tools', () => {
 
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body.services).toHaveLength(2);
-    expect(body.services.map((s: any) => s.slug).sort()).toEqual([
-      'app-one',
-      'app-two',
-    ]);
+    const slugs = body.services.map((s: Record<string, unknown>) => s.slug).sort();
+    expect(slugs).toEqual(['app-one', 'app-two']);
+
+    // Each service has correct shape
+    for (const svc of body.services as Array<Record<string, unknown>>) {
+      expect(typeof svc.slug).toBe('string');
+      expect(typeof svc.port).toBe('number');
+      expect(['creating', 'active', 'deleting']).toContain(svc.status);
+      expect(svc.error).toBeNull();
+      expect(typeof svc.createdAt).toBe('string');
+      expect(svc.createdAt).toMatch(ISO_RE);
+      expect(typeof svc.updatedAt).toBe('string');
+      expect(svc.updatedAt).toMatch(ISO_RE);
+    }
   });
 
   // -----------------------------------------------------------------------
-  // Service errors — isError + sanitized fields
+  // Service errors — isError + sanitized fields + structuredContent
   // -----------------------------------------------------------------------
 
   it('returns isError=true with stable fields on RouteManagerError', async () => {
-    // Use slug that passes Zod (non-empty) but fails the service-level
-    // slug regex (/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/)
     const callResult = await client.callTool({
       name: 'publish_service',
       arguments: { slug: '---', port: 3000 },
@@ -455,6 +487,17 @@ describe('MCP tools', () => {
     expect(body.error.code).toBe('INVALID_SLUG');
     expect(body.error.message).toBeTruthy();
     expect(body.error.retryable).toBe(false);
+
+    // structuredContent must also contain the error
+    expect(callResult.structuredContent).toBeDefined();
+    expect(callResult.structuredContent!.error).toBeDefined();
+    expect(Object.keys(callResult.structuredContent!.error as Record<string, unknown>).sort()).toEqual([
+      'code',
+      'message',
+      'retryable',
+    ]);
+    expect((callResult.structuredContent!.error as Record<string, unknown>).code).toBe('INVALID_SLUG');
+    expect((callResult.structuredContent!.error as Record<string, unknown>).retryable).toBe(false);
   });
 
   it('does not expose stack traces or environment values on error', async () => {
@@ -472,8 +515,46 @@ describe('MCP tools', () => {
     expect(text).not.toContain('RouteManagerError');
   });
 
+  it('maps error codes to fixed MCP-safe messages with no host/config leakage', async () => {
+    // INVALID_SLUG — no slug value in message
+    const slugResult = await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: '---', port: 3000 },
+    }) as CallResult;
+    const slugBody = JSON.parse(slugResult.content[0]!.text);
+    expect(slugBody.error.code).toBe('INVALID_SLUG');
+    expect(slugBody.error.message).not.toContain('---');
+    expect(slugBody.error.message).toMatch(/^[A-Z][a-zA-Z0-9 .']+\.$/); // Clean sentence
+
+    // PORT_UNREACHABLE — no host/port values in message
+    const unreachableService = new RouteService({
+      config: testConfig(),
+      store: new FakeRouteStore(),
+      dns: null,
+      probe: async () => false,
+    });
+    const [ct2, st2] = InMemoryTransport.createLinkedPair();
+    const unreachableClient = new Client(
+      { name: 'test-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    await Promise.all([
+      unreachableClient.connect(ct2),
+      createMcpServer(unreachableService).connect(st2),
+    ]);
+
+    const portResult = await unreachableClient.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'valid-app', port: 3000 },
+    }) as CallResult;
+    const portBody = JSON.parse(portResult.content[0]!.text);
+    expect(portBody.error.code).toBe('PORT_UNREACHABLE');
+    expect(portBody.error.message).not.toContain('3000');
+    expect(portBody.error.message).not.toContain('upstream');
+    expect(portBody.error.message).toMatch(/^[A-Z][a-zA-Z0-9 .']+\.$/);
+  });
+
   it('treats unknown errors as INTERNAL_ERROR with retryable=true', async () => {
-    // Make probe throw a non-RouteManagerError
     const throwingService = new RouteService({
       config: testConfig(),
       store: new FakeRouteStore(),
@@ -503,16 +584,35 @@ describe('MCP tools', () => {
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body.error).toEqual({
       code: 'INTERNAL_ERROR',
-      message: 'An internal error occurred',
+      message: 'An internal error occurred.',
       retryable: true,
     });
+
+    // structuredContent also has error
+    expect((callResult.structuredContent!.error as Record<string, unknown>).code).toBe('INTERNAL_ERROR');
+    expect((callResult.structuredContent!.error as Record<string, unknown>).retryable).toBe(true);
   });
 
   // -----------------------------------------------------------------------
-  // Output schema: dates are ISO strings
+  // Output schema: dates are ISO strings, status is enum
   // -----------------------------------------------------------------------
 
-  it('route output contains ISO date strings not Date objects', async () => {
+  it('route output status is one of creating, active, or deleting', async () => {
+    await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'enum-app', port: 5000 },
+    });
+
+    const callResult = await client.callTool({
+      name: 'list_services',
+      arguments: {},
+    }) as CallResult;
+
+    const body = JSON.parse(callResult.content[0]!.text);
+    expect(['creating', 'active', 'deleting']).toContain(body.services[0].status);
+  });
+
+  it('route output contains ISO-8601 date strings with full precision', async () => {
     await client.callTool({
       name: 'publish_service',
       arguments: { slug: 'dated-app', port: 5000 },
@@ -525,9 +625,20 @@ describe('MCP tools', () => {
 
     const body = JSON.parse(callResult.content[0]!.text);
     const svc = body.services[0];
-    expect(svc.createdAt).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/));
-    expect(svc.updatedAt).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/));
+    expect(svc.createdAt).toMatch(ISO_RE);
+    expect(svc.updatedAt).toMatch(ISO_RE);
     expect(typeof svc.createdAt).toBe('string');
     expect(typeof svc.updatedAt).toBe('string');
+  });
+
+  it('route output has nullable dnsRecordId and nullable error', async () => {
+    const callResult = await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'nullable-test', port: 5000 },
+    }) as CallResult;
+
+    const body = JSON.parse(callResult.content[0]!.text);
+    expect(body.service.dnsRecordId).toBeNull();
+    expect(body.service.error).toBeNull();
   });
 });

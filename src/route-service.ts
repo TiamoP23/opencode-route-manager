@@ -246,6 +246,18 @@ export class RouteService {
   }
 
   // -------------------------------------------------------------------------
+  // publicUrl
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns the public HTTPS URL for a given slug based on the configured
+   * publicDomain. No validation — callers must validate the slug first.
+   */
+  publicUrl(slug: string): string {
+    return `https://${slug}.${this.config.publicDomain}`;
+  }
+
+  // -------------------------------------------------------------------------
   // activeTraefikDocument
   // -------------------------------------------------------------------------
 
