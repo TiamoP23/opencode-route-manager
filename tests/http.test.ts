@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
 import type { AppConfig } from '../src/config.js';
-import type { RouteRecord, PortProbe, DnsManager } from '../src/domain.js';
+import type { RouteRecord, PortProbe } from '../src/domain.js';
 import type { RouteStore } from '../src/db/route-store.js';
 import { RouteManagerError } from '../src/errors.js';
 import { RouteService } from '../src/route-service.js';
@@ -111,29 +111,30 @@ interface AppFixture {
   close: () => Promise<void>;
 }
 
-async function startApp(): Promise<AppFixture> {
-  const config = testConfig();
-  const store = new FakeRouteStore();
-  const probe: PortProbe = async () => true;
-  const service = new RouteService({ config, store, dns: null, probe });
+  async function startApp(): Promise<AppFixture> {
+    const config = testConfig();
+    const store = new FakeRouteStore();
+    const probe: PortProbe = async () => true;
+    const service = new RouteService({ config, store, dns: null, probe });
 
-  const { createHttpApp } = await import('../src/http.js');
-  const app: Express = createHttpApp({ config, store, service });
+    const { createHttpApp } = await import('../src/http.js');
+    const app: Express = createHttpApp({ config, store, service });
 
-  const httpServer = createServer(app);
-  await new Promise<void>((resolve) => httpServer.listen(0, resolve));
-  const addr = httpServer.address() as AddressInfo;
-  const port: number = addr.port;
+    const httpServer = createServer(app);
+    await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+    const addr = httpServer.address();
+    if (!addr || typeof addr === 'string') throw new Error('server not listening');
+    const port: number = addr.port;
 
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    server: httpServer,
-    store,
-    close: async () => {
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-    },
-  };
-}
+    return {
+      baseUrl: `http://127.0.0.1:${port}`,
+      server: httpServer,
+      store,
+      close: async () => {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      },
+    };
+  }
 
 // ---------------------------------------------------------------------------
 // HTTP header helper
@@ -260,16 +261,20 @@ describe('HTTP runtime', () => {
       { name: 'test-client', version: '1.0.0' },
       { capabilities: {} },
     );
-    await client.connect(clientTransport as any);
-    const result = await client.listTools();
-    const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual([
-      'list_services',
-      'publish_service',
-      'remove_service',
-      'update_service',
-    ]);
-    await client.close();
+    try {
+      // Same SDK type-guard as src/http.ts — see there.
+      await client.connect(clientTransport as never);
+      const result = await client.listTools();
+      const names = result.tools.map((t) => t.name).sort();
+      expect(names).toEqual([
+        'list_services',
+        'publish_service',
+        'remove_service',
+        'update_service',
+      ]);
+    } finally {
+      await client.close();
+    }
   }, 20000);
 
   // -----------------------------------------------------------------------
@@ -316,8 +321,8 @@ describe('HTTP runtime', () => {
         },
       );
       // Two Authorization values in same header (array)
-      const authValue = bearer(PROVIDER_TOKEN).Authorization;
-      req.setHeader('Authorization', [authValue!, authValue!]);
+      const authValue = String(bearer(PROVIDER_TOKEN).Authorization);
+      req.setHeader('Authorization', [authValue, authValue]);
       req.end();
     });
     expect(res.statusCode).toBe(401);
@@ -383,8 +388,13 @@ describe('HTTP runtime', () => {
     const { createHttpApp } = await import('../src/http.js');
     const failApp = createHttpApp({ config: testConfig(), store: failStore, service: serviceWithFailure });
     const failServer = createServer(failApp);
-    const addr = await new Promise<AddressInfo>((resolve) => {
-      failServer.listen(0, () => resolve(failServer.address() as AddressInfo));
+    const addr = await new Promise<AddressInfo>((resolve, reject) => {
+      failServer.once('error', reject);
+      failServer.listen(0, () => {
+        const a = failServer.address();
+        if (!a || typeof a === 'string') reject(new Error('not listening'));
+        else resolve(a);
+      });
     });
     const failPort: number = addr.port;
 

@@ -60,4 +60,39 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'yes' })).toThrow(/CLOUDFLARE_PROXIED/);
     expect(() => loadConfig({ ...required, CLOUDFLARE_ZONE_ID: 'z', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_CNAME_TARGET: 'c', CLOUDFLARE_PROXIED: 'no' })).toThrow(/CLOUDFLARE_PROXIED/);
   });
+
+  // -----------------------------------------------------------------------
+  // Token character validation (finding 7)
+  // -----------------------------------------------------------------------
+
+  it('rejects MCP_TOKEN containing whitespace', () => {
+    expect(() =>
+      loadConfig({ ...required, MCP_TOKEN: 'abc def ' + 'x'.repeat(23) }),
+    ).toThrow(/MCP_TOKEN/);
+  });
+
+  it('rejects MCP_TOKEN with special characters', () => {
+    expect(() =>
+      loadConfig({ ...required, MCP_TOKEN: 'abc!def' + 'x'.repeat(25) }),
+    ).toThrow(/MCP_TOKEN/);
+  });
+
+  it('rejects MCP_TOKEN with non-ASCII characters', () => {
+    expect(() =>
+      loadConfig({ ...required, MCP_TOKEN: 'abcñde' + 'x'.repeat(26) }),
+    ).toThrow(/MCP_TOKEN/);
+  });
+
+  it('accepts tokens with underscores and hyphens', () => {
+    const token = 'a_b-c_def-ghi_jkl-mno_pqr-stu_1234';
+    expect(token.length).toBeGreaterThanOrEqual(32);
+    const config = loadConfig({ ...required, MCP_TOKEN: token });
+    expect(config.mcpToken).toBe(token);
+  });
+
+  it('rejects TRAEFIK_PROVIDER_TOKEN containing whitespace', () => {
+    expect(() =>
+      loadConfig({ ...required, TRAEFIK_PROVIDER_TOKEN: 'ab cd' + 'x'.repeat(28) }),
+    ).toThrow(/TRAEFIK_PROVIDER_TOKEN/);
+  });
 });

@@ -69,6 +69,9 @@ function validatePortSet(members: string[]): number[] {
   });
 }
 
+/** Allowed token characters: alphanumeric, underscore, hyphen. */
+const TOKEN_RE = /^[a-zA-Z0-9_-]+$/;
+
 export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   const mcpToken = env['MCP_TOKEN'] ?? '';
   const traefikProviderToken = env['TRAEFIK_PROVIDER_TOKEN'] ?? '';
@@ -76,8 +79,14 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
   if (mcpToken.length < 32) {
     throw new Error('MCP_TOKEN must be at least 32 characters');
   }
+  if (!TOKEN_RE.test(mcpToken)) {
+    throw new Error('MCP_TOKEN contains invalid characters (only a-zA-Z0-9, underscore, hyphen allowed)');
+  }
   if (traefikProviderToken.length < 32) {
     throw new Error('TRAEFIK_PROVIDER_TOKEN must be at least 32 characters');
+  }
+  if (!TOKEN_RE.test(traefikProviderToken)) {
+    throw new Error('TRAEFIK_PROVIDER_TOKEN contains invalid characters (only a-zA-Z0-9, underscore, hyphen allowed)');
   }
   if (mcpToken === traefikProviderToken) {
     throw new Error('MCP_TOKEN and TRAEFIK_PROVIDER_TOKEN must be different');

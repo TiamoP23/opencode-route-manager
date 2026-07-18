@@ -6,7 +6,6 @@ import { createMcpServer } from './mcp.js';
 import type { AppConfig } from './config.js';
 import type { RouteStore } from './db/route-store.js';
 import type { RouteService } from './route-service.js';
-import { RouteManagerError } from './errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,6 +88,13 @@ function bearerGuard(expectedToken: string): (req: Request, res: Response, next:
 
     // Reject empty token or token with whitespace
     if (!token || token !== token.trim()) {
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    // Reject characters outside allowed alphabet
+    if (!/^[a-zA-Z0-9_-]+$/.test(token)) {
       res.setHeader('WWW-Authenticate', 'Bearer');
       res.status(401).json({ error: 'Unauthorized' });
       return;
@@ -197,41 +203,51 @@ export function createHttpApp(deps: HttpAppDeps): Express {
 
   app.post('/mcp', requireMcpToken, async (req: Request, res: Response) => {
     const mcpServer = createMcpServer(service);
-    // Stateless mode — no session ID generation
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const transport = new StreamableHTTPServerTransport({}) as any;
-
-    // Wire transport lifecycle
-    await mcpServer.connect(transport);
+    // Stateless mode — no session ID generation. The SDK defaults
+    // sessionIdGenerator to undefined when omitted; we skip the field
+    // explicitly because tsconfig's exactOptionalPropertyTypes rejects
+    // { sessionIdGenerator: undefined }.
+    const transport = new StreamableHTTPServerTransport({});
 
     // Track whether we already sent a response to avoid double-send
     let responded = false;
 
+    // Idempotent cleanup helper
+    const cleanup = (): void => {
+      transport.close().catch(() => {});
+      mcpServer.close().catch(() => {});
+    };
+
     res.on('close', () => {
       if (!responded) {
         responded = true;
-        transport.close().catch(() => {});
-        mcpServer.close().catch(() => {});
+        cleanup();
       }
     });
 
     try {
+      // The SDK's StreamableHTTPServerTransport satisfies the Transport
+      // interface structurally at runtime; the type assertion handles a
+      // mismatched onclose getter/setter pattern that exactOptionalPropertyTypes
+      // surfaces in declarations but does not affect behaviour.
+      await mcpServer.connect(transport as never);
       await transport.handleRequest(req, res, req.body);
       responded = true;
     } catch {
       if (!responded) {
         responded = true;
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: { code: -32603, message: 'Internal error' },
-        });
+        res
+          .status(500)
+          .json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal error' },
+          });
       }
     } finally {
       if (!responded) {
         responded = true;
+        cleanup();
       }
-      transport.close().catch(() => {});
-      mcpServer.close().catch(() => {});
     }
   });
 
