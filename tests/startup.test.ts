@@ -155,67 +155,166 @@ describe('startup runtime', () => {
   it('initial timeout blocks scheduler; after settle scheduler resumes', async () => {
     const { startApplication } = await import('../src/index.js');
     let timerCb: (() => void) | null = null;
-    const events: string[] = [];
-    let scheduledCalls = 0;
-    let resolveSlow!: () => void;
-    const slowGate = new Promise<void>((r) => { resolveSlow = r; });
+    let callCount = 0;
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((r) => { resolveGate = r; });
+
+    // Patch BEFORE startApplication: first call (initial reconcile) hangs.
+    const orig = RouteService.prototype.reconcilePending;
+    try {
+      RouteService.prototype.reconcilePending = async function () {
+        callCount++;
+        if (callCount === 1) await gate; // initial reconcile hangs
+        return orig.call(this);
+      };
+
+      const app = await startApplication(
+        { env: baseEnv },
+        {
+          runtime: {
+            createServer: () => ({
+              listen: async () => 3001,
+              close: async () => {},
+            }),
+            setTimer: (fn) => { timerCb = fn; return { clear: () => {} }; },
+            onSignal: () => () => {},
+            deadline: async <T>(_p: Promise<T>, _ms: number) => {
+              return { success: false, timedOut: true } as const;
+            },
+            exit: () => {},
+          },
+        },
+      );
+      try {
+        // Fire timer while currentReconcile is still set → scheduler skips.
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 0));
+        expect(callCount).toBe(1);
+
+        // Release gate → promise chain settles → currentReconcile cleared.
+        resolveGate();
+        await new Promise((r) => setTimeout(r, 0));
+
+        // Fire timer again: scheduler runs → callCount becomes 2.
+        timerCb!();
+        await new Promise((r) => setTimeout(r, 0));
+        expect(callCount).toBe(2);
+      } finally {
+        await app.close();
+      }
+    } finally {
+      resolveGate();
+      RouteService.prototype.reconcilePending = orig;
+    }
+  }, 10000);
+
+  // -----------------------------------------------------------------------
+  // Initial reconcile rejection → INTERNAL_ERROR log, rollback
+  // -----------------------------------------------------------------------
+
+  it('initial reconcile rejection propagates with INTERNAL_ERROR and rolls back', async () => {
+    const { startApplication } = await import('../src/index.js');
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: string[]) => { logs.push(args.join(' ')); };
+
+    let listenCalled = false;
+    let serverClosed = false;
+    let offSignalCalled = 0;
+
+    const orig = RouteService.prototype.reconcilePending;
+    try {
+      RouteService.prototype.reconcilePending = async function () {
+        throw new RouteManagerError('INTERNAL_ERROR', 'test rejection');
+      };
+
+      await expect(
+        startApplication(
+          { env: baseEnv },
+          {
+            runtime: {
+              createServer: () => ({
+                listen: async () => { listenCalled = true; return 3001; },
+                close: async () => { serverClosed = true; },
+              }),
+              setTimer: () => ({ clear: () => {} }),
+              onSignal: () => () => { offSignalCalled++; },
+              deadline: async <T>(p: Promise<T>, _ms: number) => {
+                // Don't timeout — let the raw promise reject through
+                const value = await p;
+                return { success: true, value } as const;
+              },
+              exit: () => {},
+            },
+          },
+        ),
+      ).rejects.toThrow();
+    } finally {
+      console.log = origLog;
+      RouteService.prototype.reconcilePending = orig;
+    }
+
+    // Listen was never reached
+    expect(listenCalled).toBe(false);
+    // Server was closed during rollback
+    expect(serverClosed).toBe(true);
+    // Signals were unregistered during rollback
+    expect(offSignalCalled).toBe(2);
+    // initial_reconciliation_error with INTERNAL_ERROR was logged
+    const errLog = logs.find((l) => l.includes('initial_reconciliation_error'));
+    expect(errLog).toBeTruthy();
+    expect(errLog).toContain('INTERNAL_ERROR');
+  }, 10000);
+
+  // -----------------------------------------------------------------------
+  // Scheduled reconcile rejection → reconcile_scheduler_error log
+  // -----------------------------------------------------------------------
+
+  it('scheduled reconcile rejection logs scheduler error with INTERNAL_ERROR', async () => {
+    const { startApplication } = await import('../src/index.js');
+    let timerCb: (() => void) | null = null;
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: string[]) => { logs.push(args.join(' ')); };
 
     const app = await startApplication(
       { env: baseEnv },
       {
         runtime: {
-          createServer: () => ({
-            listen: async () => { events.push('listen'); return 3001; },
-            close: async () => { events.push('server.close'); },
-          }),
-          setTimer: (fn) => {
-            timerCb = fn;
-            return { clear: () => { events.push('timer.clear'); } };
-          },
+          createServer: () => ({ listen: async () => 3001, close: async () => {} }),
+          setTimer: (fn) => { timerCb = fn; return { clear: () => {} }; },
           onSignal: () => () => {},
-          deadline: async <T>(_p: Promise<T>, _ms: number) => {
-            events.push('deadline.timeout');
-            return { success: false, timedOut: true } as const;
+          deadline: async <T>(p: Promise<T>, _ms: number) => {
+            const value = await p;
+            return { success: true, value } as const;
           },
           exit: () => {},
         },
       },
     );
     try {
-      // At this point: deadline timed out, currentReconcile is set (initial
-      // reconcile running in the background on the real DB).  Patch so
-      // scheduled calls are observable.
+      // Patch scheduled reconcile to reject
       const orig = RouteService.prototype.reconcilePending;
       try {
         RouteService.prototype.reconcilePending = async function () {
-          scheduledCalls++;
-          events.push(`sched.${scheduledCalls}`);
-          if (scheduledCalls <= 1) await slowGate;
-          return orig.call(this);
+          throw new RouteManagerError('INTERNAL_ERROR', 'scheduled failure');
         };
 
-        // Fire timer while currentReconcile is potentially still set
         timerCb!();
-        await new Promise((r) => setTimeout(r, 200));
-        // By now the initial reconcile has settled (empty DB → fast).
-        // currentReconcile cleared by finally.  Release any gated call.
-        resolveSlow();
-        await new Promise((r) => setTimeout(r, 100));
-
-        // Fire timer again — should start exactly one new reconcile
-        timerCb!();
-        await new Promise((r) => setTimeout(r, 100));
-
-        // At least one scheduled reconcile ran
-        expect(scheduledCalls).toBeGreaterThanOrEqual(1);
+        await Promise.resolve();
       } finally {
-        resolveSlow();
         RouteService.prototype.reconcilePending = orig;
       }
+
+      // Scheduled reconcile error was logged with INTERNAL_ERROR code
+      const errLog = logs.find((l) => l.includes('reconcile_scheduler_error'));
+      expect(errLog).toBeTruthy();
+      expect(errLog).toContain('INTERNAL_ERROR');
     } finally {
+      console.log = origLog;
       await app.close();
     }
-  }, 15000);
+  }, 10000);
 
   // -----------------------------------------------------------------------
   // No-overlap scheduled reconcile

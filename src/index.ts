@@ -306,14 +306,22 @@ export async function startApplication(
     }
     const runScheduledReconcile = (): void => {
       if (shutdownPromise !== null || currentReconcile !== null) return;
-      const sched = service
-        .reconcilePending()
-        .catch(() => {})
-        .finally(() => {
-          if (currentReconcile === sched) currentReconcile = null;
-        });
-      currentReconcile = sched;
-      sched.catch(() => {});
+      try {
+        const sched = service.reconcilePending();
+        const trackedSched = sched
+          .catch(() => {
+            log('reconcile_scheduler_error', { code: 'INTERNAL_ERROR' });
+          })
+          .finally(() => {
+            if (currentReconcile === trackedSched) currentReconcile = null;
+          });
+        currentReconcile = trackedSched;
+        // Fire-and-forget the tracked promise — errors already caught
+        // above and cleared in finally.
+        trackedSched.catch(() => {});
+      } catch {
+        log('reconcile_scheduler_error', { code: 'INTERNAL_ERROR' });
+      }
     };
 
     timerHandle = runtime.setTimer(runScheduledReconcile, 30_000);
