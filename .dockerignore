@@ -1,0 +1,11 @@
+.git
+.github
+node_modules
+dist
+coverage
+tests
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.env
