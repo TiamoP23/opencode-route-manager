@@ -41,13 +41,15 @@ const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
 });
 const client = new Client({ name: 'route-manager-smoke', version: '1.0.0' });
 
+let toolFailed = false;
 try {
   await client.connect(transport);
   const result = await client.callTool({
     name: action === 'publish' ? 'publish_service' : 'remove_service',
     arguments: toolArgs,
   });
-  if (result.isError) process.exit(1);
+  if (result.isError) toolFailed = true;
 } finally {
   await client.close().catch(() => {});
 }
+if (toolFailed) process.exit(1);
