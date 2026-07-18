@@ -29,6 +29,13 @@ RUN_ID="smoke-$(date +%s)-$$"
 #
 
 # ---------------------------------------------------------------------------
+# Initialize RUNTIME before trap so cleanup always sees a set variable
+# under -u, even on early exit.  Will be reassigned below if a supported
+# runtime is found.
+# ---------------------------------------------------------------------------
+RUNTIME=""
+
+# ---------------------------------------------------------------------------
 # Cleanup — install immediately; safe when no resources exist
 # ---------------------------------------------------------------------------
 cleanup() {
@@ -45,7 +52,6 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Container runtime detection
 # ---------------------------------------------------------------------------
-RUNTIME=""
 if command -v podman &>/dev/null && podman info &>/dev/null 2>&1; then
   RUNTIME=podman
 elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
