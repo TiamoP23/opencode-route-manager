@@ -30,6 +30,10 @@ export interface CloudflareFakeServer {
   setListResponse: (records: FakeDnsRecord[], status?: number) => void;
   /** When a GET-by-ID matches the given recordId, return this HTTP status. */
   setRecordError: (recordId: string, status: number) => void;
+  /** Next POST create returns this status (one-shot). */
+  setCreateError: (status: number) => void;
+  /** Next DELETE returns this status (one-shot). */
+  setDeleteError: (status: number) => void;
   destroy: () => Promise<void>;
 }
 
@@ -37,6 +41,8 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
   let records = [...initialRecords];
   const calls: RecordedCall[] = [];
   let nextError: number | null = null;
+  let createError: number | null = null;
+  let deleteError: number | null = null;
   let listOverride: { records: FakeDnsRecord[]; status?: number | undefined } | null = null;
   const recordErrors: Record<string, number> = {};
 
@@ -148,6 +154,19 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
 
     // Create record
     if (req.method === 'POST' && !recordId) {
+      if (createError !== null) {
+        const status = createError;
+        createError = null;
+        res.statusCode = status;
+        res.end(JSON.stringify({
+          success: false,
+          errors: [{ code: status, message: http.STATUS_CODES[status] ?? 'Error' }],
+          messages: [],
+          result: null,
+        }));
+        return;
+      }
+
       const body = JSON.parse(bodyStr);
       const newRecord: FakeDnsRecord = {
         id: `fake-cf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -167,6 +186,19 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
 
     // Delete record
     if (req.method === 'DELETE' && recordId) {
+      if (deleteError !== null) {
+        const status = deleteError;
+        deleteError = null;
+        res.statusCode = status;
+        res.end(JSON.stringify({
+          success: false,
+          errors: [{ code: status, message: http.STATUS_CODES[status] ?? 'Error' }],
+          messages: [],
+          result: null,
+        }));
+        return;
+      }
+
       const idx = records.findIndex(r => r.id === recordId);
       if (idx >= 0) {
         records.splice(idx, 1);
@@ -202,6 +234,12 @@ export function createCloudflareServer(initialRecords: FakeDnsRecord[] = []): Pr
         },
         setRecordError(recordId: string, status: number) {
           recordErrors[recordId] = status;
+        },
+        setCreateError(status: number) {
+          createError = status;
+        },
+        setDeleteError(status: number) {
+          deleteError = status;
         },
         destroy: () => new Promise<void>(resolveClose => server.close(() => resolveClose())),
       });

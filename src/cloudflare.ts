@@ -86,8 +86,13 @@ export class CloudflareDnsManager implements DnsManager {
    * Returns the full parsed envelope so callers can inspect `result_info`
    * for pagination. Never exposes raw HTTP bodies or headers in public
    * messages.
+   *
+   * May throw `CloudflareHttpError` for non-ok non-mapped responses.
+   * Only `fetchRecordById` should use this directly — all other callers
+   * must use `request()` which converts every `CloudflareHttpError` into
+   * a sanitized `DNS_CONFLICT`.
    */
-  private async request<T>(
+  private async requestRaw<T>(
     method: string,
     path: string,
     body?: unknown,
@@ -149,13 +154,35 @@ export class CloudflareDnsManager implements DnsManager {
   }
 
   /**
+   * Public-facing request wrapper for all non-GET-by-ID callers.
+   * Catches every `CloudflareHttpError` and converts it into a sanitized
+   * non-retryable `DNS_CONFLICT`. This guarantees that no private error
+   * type ever escapes `listRecords`, `ensureRecord`, or `deleteRecord`.
+   */
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<CloudflareApiResponse<T>> {
+    try {
+      return await this.requestRaw<T>(method, path, body);
+    } catch (err) {
+      if (err instanceof CloudflareHttpError) {
+        throw new RouteManagerError('DNS_CONFLICT', 'Cloudflare rejected the DNS change');
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Fetch a single DNS record by ID, returning `null` when the record does
-   * not exist (HTTP 404 only). All other non-ok HTTP statuses (400, 405,
-   * etc.) are converted to DNS_CONFLICT so they surface as typed errors.
+   * not exist (HTTP 404 only). Uses `requestRaw` so it can distinguish a
+   * genuine 404 from other HTTP errors. All other non-ok HTTP statuses
+   * (400, 405, etc.) are converted to DNS_CONFLICT.
    */
   private async fetchRecordById(recordId: string): Promise<CloudflareDnsRecord | null> {
     try {
-      const resp = await this.request<CloudflareDnsRecord>(
+      const resp = await this.requestRaw<CloudflareDnsRecord>(
         'GET',
         `/zones/${this.config.zoneId}/dns_records/${recordId}`,
       );
@@ -163,7 +190,6 @@ export class CloudflareDnsManager implements DnsManager {
     } catch (err) {
       if (err instanceof CloudflareHttpError) {
         if (err.status === 404) return null; // idempotent absence
-        // Any other non-ok HTTP status → DNS_CONFLICT
         throw new RouteManagerError('DNS_CONFLICT', 'Cloudflare rejected the DNS change');
       }
       throw err; // RouteManagerError propagates unchanged

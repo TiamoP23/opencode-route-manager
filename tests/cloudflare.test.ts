@@ -432,4 +432,107 @@ describe('CloudflareDnsManager', () => {
       });
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Cloudflare rejection mapping — no private error type may escape
+  // ---------------------------------------------------------------------------
+  describe('Cloudflare rejection mapping', () => {
+    it('maps list 400 to DNS_CONFLICT with sanitized message', async () => {
+      server.setNextError(400);
+
+      await expect(manager.assertAvailable(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps list 404 to DNS_CONFLICT with sanitized message', async () => {
+      server.setNextError(404);
+
+      await expect(manager.assertAvailable(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps list 405 to DNS_CONFLICT with sanitized message', async () => {
+      server.setNextError(405);
+
+      await expect(manager.assertAvailable(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps create 400 to DNS_CONFLICT with sanitized message', async () => {
+      // ensureRecord first does a GET (hostname is free → empty list),
+      // then POSTs. setCreateError makes only the POST fail.
+      server.setCreateError(400);
+
+      await expect(manager.ensureRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps create 404 to DNS_CONFLICT with sanitized message', async () => {
+      server.setCreateError(404);
+
+      await expect(manager.ensureRecord(HOSTNAME, SLUG)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps delete 400 to DNS_CONFLICT with sanitized message', async () => {
+      // deleteRecord first GETs by ID (record exists), then DELETEs
+      server.setRecords([ownedRecord('cf-del-400')]);
+      server.setDeleteError(400);
+
+      const route = makeRoute({ cloudflareRecordId: 'cf-del-400' });
+      await expect(manager.deleteRecord(route, HOSTNAME)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('maps delete 405 to DNS_CONFLICT with sanitized message', async () => {
+      server.setRecords([ownedRecord('cf-del-405')]);
+      server.setDeleteError(405);
+
+      const route = makeRoute({ cloudflareRecordId: 'cf-del-405' });
+      await expect(manager.deleteRecord(route, HOSTNAME)).rejects.toMatchObject({
+        code: 'DNS_CONFLICT',
+        retryable: false,
+      });
+    });
+
+    it('never leaks private error details in the message', async () => {
+      // Run each rejection pathway and verify the message is always the
+      // sanitized 'Cloudflare rejected the DNS change' string. No status
+      // codes, no payloads, no authorization tokens.
+      const checkMessage = async (p: Promise<unknown>) => {
+        try {
+          await p;
+          expect.unreachable('should have thrown');
+        } catch (err) {
+          expect(err).toBeInstanceOf(RouteManagerError);
+          expect((err as RouteManagerError).message).toBe('Cloudflare rejected the DNS change');
+        }
+      };
+
+      // List 400
+      server.setNextError(400);
+      await checkMessage(manager.assertAvailable(HOSTNAME, SLUG));
+
+      // Create 400
+      server.setCreateError(400);
+      await checkMessage(manager.ensureRecord(HOSTNAME, SLUG));
+
+      // Delete 400
+      server.setRecords([ownedRecord('cf-leak')]);
+      server.setDeleteError(400);
+      await checkMessage(manager.deleteRecord(makeRoute({ cloudflareRecordId: 'cf-leak' }), HOSTNAME));
+    });
+  });
 });
