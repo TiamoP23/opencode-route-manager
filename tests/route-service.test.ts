@@ -1134,6 +1134,59 @@ describe('RouteService', () => {
       expect(log.significant()).toEqual(['store.listPending']);
     });
 
+    it('reconcile re-checks backoff from fresh row behind slug lock', async () => {
+      vi.useFakeTimers();
+      // Insert a creating row — updatedAt = fake time 0
+      await store.insertCreating({ slug: 'backoff-slug', port: 3000, description: null });
+      dns._addRecord('backoff-slug.tiamop23.de', 'backoff-slug', 'cf-backoff');
+      // Advance 10s — well past any backoff for retryCount=0 (~1200ms max)
+      vi.advanceTimersByTime(10_000);
+
+      // Hold the slug lock so reconcile is forced to queue behind it
+      let release: () => void;
+      const blocked = new Promise<void>((r) => { release = r; });
+      const slugLock = (svc as unknown as { slugLock: KeyedLock }).slugLock;
+      const holdPromise = slugLock.run('backoff-slug', () => blocked);
+
+      // Spy on slugLock.run to signal when reconcile attempts this slug
+      let resolveReconcileQueued: () => void;
+      const reconcileQueued = new Promise<void>((r) => { resolveReconcileQueued = r; });
+      const origRun = slugLock.run.bind(slugLock);
+      slugLock.run = ((key: string, operation: () => Promise<unknown>) => {
+        if (key === 'backoff-slug') resolveReconcileQueued();
+        return origRun(key, operation);
+      }) as typeof slugLock.run;
+
+      // Start reconcile — listPending() returns a cloned snapshot with
+      // updatedAt=0 (way past backoff). reconcile queues behind the held lock.
+      log.clear();
+      const reconcilePromise = svc.reconcilePending();
+
+      // Wait for reconcile to attempt the slug lock
+      await reconcileQueued;
+
+      // Mutate the stored row directly (no log entry): bring updatedAt to
+      // current fake time (10_000ms), making fresh elapsed time = 0.
+      // Leave lastErrorCode null (retryable) so only the backoff re-check
+      // prevents processing — no jitter ambiguity since 0 < min(1000, ...).
+      const rawData = store._rawData();
+      const row = rawData.get('backoff-slug')!;
+      row.updatedAt = new Date();
+
+      // Release — reconciler's callback now runs
+      release!();
+      await holdPromise;
+      await reconcilePromise;
+
+      // The reconciler re-reads the row, re-checks backoff, sees elapsed=0,
+      // and skips (0 < 1000ms base delay)
+      const current = await store.get('backoff-slug');
+      expect(current).not.toBeNull();
+      expect(current!.status).toBe('creating');
+      // No probe, DNS, or activate from the reconciler
+      expect(log.significant()).toEqual(['store.listPending']);
+    });
+
     it('reconcile isolating deleting cleanup failures across rows', async () => {
       vi.useFakeTimers();
 
