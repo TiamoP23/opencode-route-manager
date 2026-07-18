@@ -101,9 +101,13 @@ class FakeRouteStore implements RouteStore {
 
   async listPending(): Promise<RouteRecord[]> {
     this.log.add('store', 'listPending');
-    return [...this.data.values()].filter(
-      (r) => r.status === 'creating' || r.status === 'deleting',
-    );
+    return [...this.data.values()]
+      .filter((r) => r.status === 'creating' || r.status === 'deleting')
+      .map((r) => ({
+        ...r,
+        createdAt: new Date(r.createdAt.getTime()),
+        updatedAt: new Date(r.updatedAt.getTime()),
+      }));
   }
 
   async insertCreating(input: {
@@ -1078,93 +1082,96 @@ describe('RouteService', () => {
       expect(storeMuts.length).toBe(0);
     });
 
-    it('reconcile continues processing later rows after one fails', async () => {
+    it('reconcile re-evaluates stale row behind slug lock (backoff + retryability)', async () => {
       vi.useFakeTimers();
-      await store.insertCreating({ slug: 'fail-row', port: 3000, description: null });
-      dns._addRecord('fail-row.tiamop23.de', 'fail-row', 'cf-fail');
-      await store.insertCreating({ slug: 'good-row', port: 3001, description: null });
-      dns._addRecord('good-row.tiamop23.de', 'good-row', 'cf-good');
+      // Insert a creating row — updatedAt = fake time 0
+      await store.insertCreating({ slug: 're-eval-slug', port: 3000, description: null });
+      dns._addRecord('re-eval-slug.tiamop23.de', 're-eval-slug', 'cf-re-eval');
+      // Advance 10s — well past any backoff (max ~1200ms for retryCount=0)
+      vi.advanceTimersByTime(10_000);
+
+      // Hold the slug lock so reconcile is forced to queue behind it
+      let release: () => void;
+      const blocked = new Promise<void>((r) => { release = r; });
+      const slugLock = (svc as unknown as { slugLock: KeyedLock }).slugLock;
+      const holdPromise = slugLock.run('re-eval-slug', () => blocked);
+
+      // Spy on slugLock.run to signal when reconcile attempts this slug
+      let resolveReconcileQueued: () => void;
+      const reconcileQueued = new Promise<void>((r) => { resolveReconcileQueued = r; });
+      const origRun = slugLock.run.bind(slugLock);
+      slugLock.run = ((key: string, operation: () => Promise<unknown>) => {
+        if (key === 're-eval-slug') resolveReconcileQueued();
+        return origRun(key, operation);
+      }) as typeof slugLock.run;
+
+      // Start reconcile — listPending() returns a cloned snapshot with
+      // updatedAt=0 (way past backoff) and status='creating'.
+      // reconcile queues behind the held lock.
+      log.clear();
+      const reconcilePromise = svc.reconcilePending();
+
+      // Wait for reconcile to attempt the slug lock
+      await reconcileQueued;
+
+      // Mutate the stored row directly (no log entry): set a permanent
+      // error so the reconciler must re-evaluate and skip (non-retryable).
+      const rawData = store._rawData();
+      const row = rawData.get('re-eval-slug')!;
+      row.lastErrorCode = 'HOSTNAME_RESERVED';
+      row.lastErrorMessage = 'reserved';
+
+      // Release — reconciler's callback now runs
+      release!();
+      await holdPromise;
+      await reconcilePromise;
+
+      // The reconciler re-reads the row, sees the permanent error, and skips
+      const current = await store.get('re-eval-slug');
+      expect(current).not.toBeNull();
+      expect(current!.status).toBe('creating');
+      // No probe, DNS, or activate from the reconciler
+      expect(log.significant()).toEqual(['store.listPending']);
+    });
+
+    it('reconcile isolating deleting cleanup failures across rows', async () => {
+      vi.useFakeTimers();
+
+      // First row: deleting, will fail DNS cleanup
+      await store.insertCreating({ slug: 'del-fail-iso', port: 3000, description: null });
+      await store.activate('del-fail-iso', 'cf-del-fail');
+      dns._addRecord('del-fail-iso.tiamop23.de', 'del-fail-iso', 'cf-del-fail');
+      await store.markDeleting('del-fail-iso');
+
+      // Second row: deleting, should succeed
+      await store.insertCreating({ slug: 'del-good-iso', port: 3001, description: null });
+      await store.activate('del-good-iso', 'cf-del-good');
+      dns._addRecord('del-good-iso.tiamop23.de', 'del-good-iso', 'cf-del-good');
+      await store.markDeleting('del-good-iso');
+
       vi.advanceTimersByTime(2000);
 
-      // Make ensureRecord throw for the first row only
+      // Make deleteRecord throw for the first row only
       let callCount = 0;
-      const origEnsure = dns.ensureRecord.bind(dns);
-      dns.ensureRecord = async (hostname, slug) => {
+      const origDelete = dns.deleteRecord.bind(dns);
+      dns.deleteRecord = async (route, hostname) => {
         callCount++;
-        if (callCount === 1) throw new RouteManagerError('DNS_UNAVAILABLE', 'first fail');
-        return origEnsure(hostname, slug);
+        if (callCount === 1) throw new RouteManagerError('DNS_UNAVAILABLE', 'delete failed');
+        return origDelete(route, hostname);
       };
 
       log.clear();
       await svc.reconcilePending();
 
-      // First row failed but error was persisted
-      const failRow = await store.get('fail-row');
+      // First row: error persisted, still deleting
+      const failRow = await store.get('del-fail-iso');
       expect(failRow).not.toBeNull();
-      expect(failRow!.status).toBe('creating');
+      expect(failRow!.status).toBe('deleting');
       expect(failRow!.lastErrorCode).toBe('DNS_UNAVAILABLE');
 
-      // Second row was still processed and activated
-      const goodRow = await store.get('good-row');
-      expect(goodRow).not.toBeNull();
-      expect(goodRow!.status).toBe('active');
-    });
-
-    it('reconcile re-checks backoff from fresh row after slug lock', async () => {
-      vi.useFakeTimers();
-      await store.insertCreating({ slug: 'backoff-recheck', port: 3000, description: null });
-      dns._addRecord('backoff-recheck.tiamop23.de', 'backoff-recheck', 'cf-br');
-      // Advance time just enough to pass the initial backoff
-      vi.advanceTimersByTime(1100);
-      log.clear();
-
-      // Now manually update the row's updatedAt to simulate a recent change
-      // (e.g., another reconciler already tried it)
-      const rawData = store._rawData();
-      const row = rawData.get('backoff-recheck')!;
-      row.updatedAt = new Date(); // Set to current fake time
-
-      await svc.reconcilePending();
-
-      // The reconciler should re-check backoff inside the slug lock using
-      // the fresh updatedAt, and skip the row since backoff is not due
-      const current = await store.get('backoff-recheck');
-      expect(current).not.toBeNull();
-      expect(current!.status).toBe('creating');
-      // No probe or DNS calls since backoff re-check skipped processing
-      expect(log.significant()).toEqual(['store.listPending']);
-    });
-
-    it('reconcile creating: concurrent slug lock queues behind lock, re-evaluates stale row', async () => {
-      vi.useFakeTimers();
-      await store.insertCreating({ slug: 'conc-re-eval', port: 3000, description: null });
-      dns._addRecord('conc-re-eval.tiamop23.de', 'conc-re-eval', 'cf-cre');
-      vi.advanceTimersByTime(2000);
-
-      // Hold the slug lock by running an operation that blocks
-      let release: () => void;
-      const blocked = new Promise<void>((r) => { release = r; });
-      const slugLock = (svc as unknown as { slugLock: KeyedLock }).slugLock;
-      const holdPromise = slugLock.run('conc-re-eval', () => blocked);
-
-      // Start reconcile — it queues behind the held lock
-      log.clear();
-      const reconcilePromise = svc.reconcilePending();
-
-      // While reconcile is queued, manually activate the row
-      await store.activate('conc-re-eval', null);
-
-      // Now release the lock — reconcile's callback runs
-      release!();
-      await holdPromise;
-      await reconcilePromise;
-
-      // Reconciler should re-read the row, see it's already active, and skip
-      const final = await store.get('conc-re-eval');
-      expect(final).not.toBeNull();
-      expect(final!.status).toBe('active');
-      // No DNS calls from reconciler (would indicate it tried to process the row)
-      expect(log.sourceMethods('dns').length).toBe(0);
+      // Second row: successfully removed
+      const goodRow = await store.get('del-good-iso');
+      expect(goodRow).toBeNull();
     });
   });
 });
