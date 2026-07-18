@@ -133,5 +133,5 @@ node tests/helpers/mcp-smoke-client.mjs publish demo 5173
 Your app will be proxied through Traefik with the middleware configured by
 `TRAEFIK_MIDDLEWARE` (default: BasicAuth). The public URL uses
 `PUBLIC_DOMAIN` (e.g., `https://demo.tiamop23.de`). Note that the port
-5713 must be reachable at `UPSTREAM_HOST:5173` (the `opencode` container on
+5173 must be reachable at `UPSTREAM_HOST:5173` (the `opencode` container on
 the internal network).

@@ -76,10 +76,12 @@ runtime_port() {
 # ---------------------------------------------------------------------------
 poll_url() {
   local url="$1" expected="$2" label="$3"
-  local max="${4:-15}" i
+  local max="${4:-15}" i header="${5:-}"
+  local curl_extra=()
+  [ -n "$header" ] && curl_extra=(-H "$header")
   for i in $(seq 1 "$max"); do
     local code
-    code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${curl_extra[@]}" "$url" 2>/dev/null || echo "000")
     if [ "$code" = "$expected" ]; then
       echo "  [${i}s] ${label} → ${expected}" >&2
       return 0
@@ -100,10 +102,12 @@ poll_url() {
 # ---------------------------------------------------------------------------
 poll_body() {
   local url="$1" expected="$2" label="$3"
-  local max="${4:-15}" i
+  local max="${4:-15}" i header="${5:-}"
+  local curl_extra=()
+  [ -n "$header" ] && curl_extra=(-H "$header")
   for i in $(seq 1 "$max"); do
     local body
-    body=$(curl -fsS "$url" 2>/dev/null || true)
+    body=$(curl -fsS "${curl_extra[@]}" "$url" 2>/dev/null || true)
     if [ "$body" = "$expected" ]; then
       echo "  [${i}s] ${label} → body matched" >&2
       return 0
@@ -283,17 +287,18 @@ node "$ROOT_DIR/tests/helpers/mcp-smoke-client.mjs" publish route-smoke 8080
 # 7e. Poll Traefik route without BasicAuth → 401
 echo "--- traefik route without BasicAuth (expected: 401) ---" >&2
 poll_url "http://127.0.0.1:${TRAEFIK_PORT}" 401 \
-  "route-smoke.tiamop23.de (no auth)" || exit 1
+  "route-smoke.tiamop23.de (no auth)" 15 "Host: route-smoke.tiamop23.de" || exit 1
 
 # 7f. Traefik route with BasicAuth → 200 + "route-target"
 echo "--- traefik route with BasicAuth (expected: 200 + route-target) ---" >&2
 poll_body "http://opencode:test@127.0.0.1:${TRAEFIK_PORT}" "route-target" \
-  "route-smoke.tiamop23.de (BasicAuth)" || exit 1
+  "route-smoke.tiamop23.de (BasicAuth)" 15 "Host: route-smoke.tiamop23.de" || exit 1
 
 # 7g. WebSocket upgrade via Traefik with BasicAuth → 101
 echo "--- websocket upgrade via Traefik (expected: 101) ---" >&2
 WS_KEY="dGhlIHNhbXBsZSBub25jZQ=="
 UPGRADE=$(curl --http1.1 -isS -u opencode:test \
+  --max-time 10 \
   -H 'Host: route-smoke.tiamop23.de' \
   -H 'Connection: Upgrade' \
   -H 'Upgrade: websocket' \
@@ -316,7 +321,7 @@ node "$ROOT_DIR/tests/helpers/mcp-smoke-client.mjs" remove route-smoke
 # 7i. Poll for removed route → 404
 echo "--- verify removal (poll for 404) ---" >&2
 poll_url "http://127.0.0.1:${TRAEFIK_PORT}" 404 \
-  "removed route-smoke" 20 || exit 1
+  "removed route-smoke" 20 "Host: route-smoke.tiamop23.de" || exit 1
 
 # ---------------------------------------------------------------------------
 echo "=== smoke test PASSED ===" >&2
