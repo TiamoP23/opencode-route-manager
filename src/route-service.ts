@@ -89,6 +89,17 @@ export class RouteService {
     this.onReconcileEvent = deps.onReconcileEvent;
   }
 
+  /**
+   * Non-throwing event emitter for reconciliation errors.
+   * Callback failures are silently caught so they never change the
+   * already-persisted error or stop later rows from being processed.
+   */
+  private emitReconcileEvent(slug: string, status: 'creating' | 'deleting', code: string): void {
+    try {
+      this.onReconcileEvent?.({ slug, status, code });
+    } catch { /* callback failure must not affect reconciliation */ }
+  }
+
   // -------------------------------------------------------------------------
   // publish
   // -------------------------------------------------------------------------
@@ -338,11 +349,7 @@ export class RouteService {
                 code: 'PORT_UNREACHABLE',
                 message: `port ${current.port} on ${this.config.upstreamHost} is not reachable`,
               });
-              this.onReconcileEvent?.({
-                slug: row.slug,
-                status: 'creating',
-                code: 'PORT_UNREACHABLE',
-              });
+              this.emitReconcileEvent(row.slug, 'creating', 'PORT_UNREACHABLE');
               return;
             }
 
@@ -358,11 +365,7 @@ export class RouteService {
                   ? err
                   : new RouteManagerError('INTERNAL_ERROR', 'An internal error occurred');
                 await this.store.recordError(current.slug, { code: sanitized.code, message: sanitized.message });
-                this.onReconcileEvent?.({
-                  slug: current.slug,
-                  status: 'creating',
-                  code: sanitized.code,
-                });
+                this.emitReconcileEvent(current.slug, 'creating', sanitized.code);
                 return;
               }
             }
@@ -394,11 +397,7 @@ export class RouteService {
               await this.performDnsCleanup(current.slug);
             } catch (err) {
               const code = err instanceof RouteManagerError ? err.code : 'INTERNAL_ERROR';
-              this.onReconcileEvent?.({
-                slug: current.slug,
-                status: 'deleting',
-                code,
-              });
+              this.emitReconcileEvent(current.slug, 'deleting', code);
               return; // leave row in deleting state for retry
             }
 
@@ -413,13 +412,7 @@ export class RouteService {
         try {
           await this.store.recordError(row.slug, { code, message: 'An internal error occurred' });
         } catch { /* persistence failure must not prevent later rows */ }
-        try {
-          this.onReconcileEvent?.({
-            slug: row.slug,
-            status: row.status as 'creating' | 'deleting',
-            code,
-          });
-        } catch { /* event emission failure must not prevent later rows */ }
+        this.emitReconcileEvent(row.slug, row.status as 'creating' | 'deleting', code);
       }
     }
   }

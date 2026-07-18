@@ -111,9 +111,10 @@ docker build -t opencode-route-manager:test .
 # Container smoke test (requires podman or docker on the host)
 # The smoke script needs a working rootless Podman or Docker daemon.
 # SKIP_CONTAINER_SMOKE=1 permits a clean skip only when no working
-# container runtime is available on the host. If a runtime is present,
-# the environment variable does not prevent the script from attempting
-# to use it — remove the runtime or adjust the check in the script.
+# container runtime is available on the host. When intentionally
+# omitting the container smoke, run the non-container steps (npm test,
+# typecheck, build) separately. Do not rely on the environment variable
+# to skip an existing runtime.
 SKIP_CONTAINER_SMOKE=1 bash tests/container-smoke.sh
 ```
 

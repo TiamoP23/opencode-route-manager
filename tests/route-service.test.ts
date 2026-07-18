@@ -1296,6 +1296,194 @@ describe('RouteService', () => {
       expect(row2!.status).toBe('active');
     });
 
+    it('reconcile creating: store.activate() throws persists INTERNAL_ERROR and continues to next row', async () => {
+      vi.useFakeTimers();
+
+      const events: Array<{ slug: string; status: string; code: string }> = [];
+      const eventSvc = new RouteService({
+        config: config(),
+        store,
+        dns,
+        probe: loggedProbe(true, log),
+        onReconcileEvent: (evt) => { events.push(evt); },
+      });
+
+      // First row: creating, activate will throw
+      await store.insertCreating({ slug: 'activate-fail', port: 3000, description: null });
+      dns._addRecord('activate-fail.tiamop23.de', 'activate-fail', 'cf-af');
+      // Second row: creating, should succeed
+      await store.insertCreating({ slug: 'activate-ok', port: 3001, description: null });
+      dns._addRecord('activate-ok.tiamop23.de', 'activate-ok', 'cf-ao');
+
+      vi.advanceTimersByTime(10_000);
+
+      // Make store.activate throw (simulates unexpected DB failure)
+      const origActivate = store.activate.bind(store);
+      let firstActivate = true;
+      store.activate = async (slug, _recordId) => {
+        if (slug === 'activate-fail' && firstActivate) {
+          firstActivate = false;
+          throw new Error('db failure during activate');
+        }
+        return origActivate(slug, _recordId);
+      };
+
+      log.clear();
+      await eventSvc.reconcilePending();
+
+      // First row: INTERNAL_ERROR persisted
+      const row1 = await store.get('activate-fail');
+      expect(row1).not.toBeNull();
+      expect(row1!.lastErrorCode).toBe('INTERNAL_ERROR');
+      expect(row1!.retryCount).toBeGreaterThanOrEqual(1);
+
+      // INTERNAL_ERROR is not in retryable set, so auto-retry is blocked
+      expect(row1!.status).not.toBe('active');
+
+      // Second row: successfully activated
+      const row2 = await store.get('activate-ok');
+      expect(row2).not.toBeNull();
+      expect(row2!.status).toBe('active');
+
+      // Reconciliation event emitted for the outer catch
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0]!.slug).toBe('activate-fail');
+      expect(events[0]!.code).toBe('INTERNAL_ERROR');
+    });
+
+    it('reconcile deleting: store.remove() throws persists INTERNAL_ERROR and continues to next row', async () => {
+      vi.useFakeTimers();
+
+      const events: Array<{ slug: string; status: string; code: string }> = [];
+      const eventSvc = new RouteService({
+        config: config(),
+        store,
+        dns: null,
+        probe: loggedProbe(true, log),
+        onReconcileEvent: (evt) => { events.push(evt); },
+      });
+
+      // First row: creating → active → deleting, remove will throw
+      await store.insertCreating({ slug: 'remove-fail', port: 3000, description: null });
+      await store.activate('remove-fail', null);
+      await store.markDeleting('remove-fail');
+      // Second row: create → active → delete, should succeed
+      await store.insertCreating({ slug: 'remove-ok', port: 3001, description: null });
+      await store.activate('remove-ok', null);
+      await store.markDeleting('remove-ok');
+
+      vi.advanceTimersByTime(2000);
+
+      // Make store.remove throw for the first row only
+      const origRemove = store.remove.bind(store);
+      let firstRemove = true;
+      store.remove = async (slug) => {
+        if (slug === 'remove-fail' && firstRemove) {
+          firstRemove = false;
+          throw new Error('db failure during remove');
+        }
+        return origRemove(slug);
+      };
+
+      log.clear();
+      await eventSvc.reconcilePending();
+
+      // First row: INTERNAL_ERROR persisted, still deleting
+      const row1 = await store.get('remove-fail');
+      expect(row1).not.toBeNull();
+      expect(row1!.lastErrorCode).toBe('INTERNAL_ERROR');
+      expect(row1!.status).toBe('deleting');
+
+      // Second row: successfully removed
+      const row2 = await store.get('remove-ok');
+      expect(row2).toBeNull();
+
+      // Event emitted for the outer catch
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0]!.slug).toBe('remove-fail');
+      expect(events[0]!.code).toBe('INTERNAL_ERROR');
+    });
+
+    it('reconcile creating: callback throw after PORT_UNREACHABLE preserves original error', async () => {
+      vi.useFakeTimers();
+
+      const events: Array<{ slug: string; status: string; code: string }> = [];
+      const eventSvc = new RouteService({
+        config: config(),
+        store,
+        dns: null,
+        probe: loggedProbe(false, log),
+        onReconcileEvent: (evt) => {
+          events.push(evt);
+          throw new Error('callback failure');
+        },
+      });
+
+      // Row with PORT_UNREACHABLE stored error should be re-attempted since PORT_UNREACHABLE is retryable
+      await store.insertCreating({ slug: 'cb-port-unreach', port: 3000, description: null });
+
+      vi.advanceTimersByTime(10_000);
+      log.clear();
+
+      await eventSvc.reconcilePending();
+
+      // Original PORT_UNREACHABLE must be preserved despite callback throw
+      const row = await store.get('cb-port-unreach');
+      expect(row).not.toBeNull();
+      expect(row!.lastErrorCode).toBe('PORT_UNREACHABLE');
+      // Error remains retryable for auto-retry
+      expect(row!.status).toBe('creating');
+
+      // Event was attempted despite the throw
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0]!.code).toBe('PORT_UNREACHABLE');
+    });
+
+    it('reconcile creating: callback throw after retryable DNS error preserves original code', async () => {
+      vi.useFakeTimers();
+
+      const events: Array<{ slug: string; status: string; code: string }> = [];
+      const eventSvc = new RouteService({
+        config: config(),
+        store,
+        dns,
+        probe: loggedProbe(true, log),
+        onReconcileEvent: (evt) => {
+          events.push(evt);
+          throw new Error('callback failure');
+        },
+      });
+
+      await store.insertCreating({ slug: 'cb-dns-retry', port: 3000, description: null });
+      dns._addRecord('cb-dns-retry.tiamop23.de', 'cb-dns-retry', 'cf-cb');
+
+      // Make ensureRecord throw DNS_UNAVAILABLE so the inner catch persists it
+      const origEnsure = dns.ensureRecord.bind(dns);
+      dns.ensureRecord = async () => {
+        throw new RouteManagerError('DNS_UNAVAILABLE', 'dns temporarily unavailable');
+      };
+
+      vi.advanceTimersByTime(10_000);
+      log.clear();
+
+      await eventSvc.reconcilePending();
+
+      // Original DNS_UNAVAILABLE must be preserved despite callback throw
+      const row = await store.get('cb-dns-retry');
+      expect(row).not.toBeNull();
+      expect(row!.lastErrorCode).toBe('DNS_UNAVAILABLE');
+      // DNS_UNAVAILABLE is retryable, so auto-retry remains possible
+      expect(row!.status).toBe('creating');
+      expect(row!.retryCount).toBeGreaterThanOrEqual(1);
+
+      // Event was attempted despite the throw
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0]!.code).toBe('DNS_UNAVAILABLE');
+
+      // Restore
+      dns.ensureRecord = origEnsure;
+    });
+
     it('reconcile isolating deleting cleanup failures across rows', async () => {
       vi.useFakeTimers();
 
