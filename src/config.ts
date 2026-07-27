@@ -144,7 +144,7 @@ export function loadConfig(
   }
   const middleware = managedBasicAuth
     ? MANAGED_MIDDLEWARE_NAME
-    : explicitMiddleware || 'dev-basic-auth@file';
+    : explicitMiddleware ?? 'dev-basic-auth@file';
 
   return {
     listenHost: env['LISTEN_HOST'] ?? '0.0.0.0',

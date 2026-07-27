@@ -145,4 +145,10 @@ describe('loadConfig', () => {
     expect(config.managedBasicAuth).toBeNull();
     expect(config.middleware).toBe('test-auth@file');
   });
+
+  it('preserves empty explicit external middleware for backward compatibility', () => {
+    const config = loadConfig({ ...required, TRAEFIK_MIDDLEWARE: '' });
+    expect(config.managedBasicAuth).toBeNull();
+    expect(config.middleware).toBe('');
+  });
 });
