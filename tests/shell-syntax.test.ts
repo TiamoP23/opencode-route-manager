@@ -53,7 +53,9 @@ describe('container-smoke.sh', () => {
 
   it('asserts route-manager runs as non-root UID 1000', () => {
     expect(smokeContent).toContain('id -u');
-    expect(smokeContent).toContain('[ "$EUID" != "1000" ]');
+    expect(smokeContent).toContain('CONTAINER_UID=');
+    expect(smokeContent).toContain('[ "$CONTAINER_UID" != "1000" ]');
+    expect(smokeContent).not.toContain('[ "$EUID"');
     expect(smokeContent).toContain('route-manager expected effective UID 1000');
   });
 });

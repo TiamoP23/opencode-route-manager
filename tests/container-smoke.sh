@@ -261,12 +261,12 @@ curl -fsS "http://127.0.0.1:${MANAGER_PORT}/health"
 
 # 7a1. Route-manager container runs as non-root user (effective UID 1000)
 echo "--- non-root user assertion ---" >&2
-EUID=$($RUNTIME exec "${RUN_ID}-route-manager" id -u 2>/dev/null || echo "unknown")
-if [ "$EUID" != "1000" ]; then
-  echo "FAIL: route-manager expected effective UID 1000, got ${EUID}" >&2
+CONTAINER_UID=$($RUNTIME exec "${RUN_ID}-route-manager" id -u 2>/dev/null || echo "unknown")
+if [ "$CONTAINER_UID" != "1000" ]; then
+  echo "FAIL: route-manager expected effective UID 1000, got ${CONTAINER_UID}" >&2
   exit 1
 fi
-echo "  route-manager runs as UID ${EUID}" >&2
+echo "  route-manager runs as UID ${CONTAINER_UID}" >&2
 
 # 7b. Traefik provider endpoint with bearer token
 echo "--- provider endpoint with token ---" >&2

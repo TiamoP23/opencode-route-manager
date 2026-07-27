@@ -15,7 +15,7 @@ configuration and optional Cloudflare DNS.
 | `UPSTREAM_HOST` | `opencode` | No | Container hostname used for port-probe connectivity checks. Published apps must be reachable at `UPSTREAM_HOST:{port}`. |
 | `PUBLIC_DOMAIN` | `tiamop23.de` | No | Public domain for generated routes (e.g. `{slug}.tiamop23.de`). |
 | `BASIC_AUTH_PASSWORD` | - | No | Enables route-manager-managed BasicAuth. Pass the same password used by OpenCode/code-server. Must be non-empty and at most 72 UTF-8 bytes. Mutually exclusive with `TRAEFIK_MIDDLEWARE`. |
-| `BASIC_AUTH_USERNAME` | `opencode` | No | Username for managed BasicAuth; 1-64 ASCII letters, digits, `.`, `_`, or `-`. Only effective when `BASIC_AUTH_PASSWORD` is set. |
+| `BASIC_AUTH_USERNAME` | `opencode` | No | Username for managed BasicAuth; 1-64 ASCII letters, digits, `.`, `_`, or `-`. Requires `BASIC_AUTH_PASSWORD`; setting it without `BASIC_AUTH_PASSWORD` is an error. |
 | `TRAEFIK_MIDDLEWARE` | `dev-basic-auth@file` | No | External middleware reference used only when `BASIC_AUTH_PASSWORD` is absent. |
 | `MIN_PORT` | `1024` | No | Minimum allowed target port. |
 | `MAX_PORT` | `65535` | No | Maximum allowed target port. |
