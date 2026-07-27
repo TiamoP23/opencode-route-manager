@@ -44,6 +44,7 @@ const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
 const client = new Client({ name: 'route-manager-smoke', version: '1.0.0' });
 
 let toolFailed = false;
+let toolFailureDetail = null;
 let validationError = null;
 let resultToLog = null;
 try {
@@ -54,6 +55,11 @@ try {
   });
   if (result.isError) {
     toolFailed = true;
+    const structuredError = result.structuredContent?.error;
+    const contentText = result.content?.find((item) => item.type === 'text')?.text;
+    toolFailureDetail = structuredError
+      ? JSON.stringify(structuredError)
+      : contentText ?? 'unknown error';
   } else if (action === 'publish') {
     if (!result.structuredContent) {
       validationError = 'publish_service response missing structuredContent';
@@ -92,7 +98,7 @@ if (resultToLog) {
   console.log(JSON.stringify(resultToLog));
 }
 if (toolFailed) {
-  process.exit(1);
+  fail(`tool call failed: ${toolFailureDetail}`);
 }
 if (validationError) {
   fail(validationError);

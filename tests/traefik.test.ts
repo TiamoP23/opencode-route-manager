@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AppConfig } from '../src/config.js';
+import { loadConfig, type AppConfig } from '../src/config.js';
 import type { RouteRecord } from '../src/domain.js';
 import { buildTraefikDocument } from '../src/traefik.js';
 import { RouteManagerError } from '../src/errors.js';
@@ -142,18 +142,25 @@ describe('buildTraefikDocument', () => {
   });
 
   it('references the provider-managed middleware without a provider suffix', () => {
-    const managed = {
-      ...config,
-      middleware: MANAGED_MIDDLEWARE_NAME,
-      managedBasicAuth: {
-        username: 'opencode',
-        userEntry: 'opencode:$2b$12$hash',
+    const rawPassword = 'raw-password-not-in-provider-document';
+    const managed = loadConfig(
+      {
+        MCP_TOKEN: 'm'.repeat(32),
+        TRAEFIK_PROVIDER_TOKEN: 't'.repeat(32),
+        BASIC_AUTH_PASSWORD: rawPassword,
       },
-    };
+      { hashPassword: () => '$2b$12$hash' },
+    );
     const doc = buildTraefikDocument([activeRoute('demo', 5173)], managed);
     expect(doc.http.routers['agent-demo']!.middlewares)
       .toEqual([MANAGED_MIDDLEWARE_NAME]);
-    expect(JSON.stringify(doc)).not.toContain('secret');
+    expect(doc.http.middlewares[MANAGED_MIDDLEWARE_NAME]).toEqual({
+      basicAuth: {
+        users: ['opencode:$2b$12$hash'],
+        removeHeader: true,
+      },
+    });
+    expect(JSON.stringify(doc)).not.toContain(rawPassword);
   });
 
   it('uses the shared MANAGED_MIDDLEWARE_NAME constant for the middleware key', () => {

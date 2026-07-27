@@ -31,7 +31,17 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
         };
       }
       if (scenario === 'tool-error') {
-        return { isError: true };
+        return {
+          isError: true,
+          content: [{ type: 'text', text: '{"error":{"code":"PORT_UNREACHABLE","message":"target refused connection","retryable":true}}' }],
+          structuredContent: {
+            error: {
+              code: 'PORT_UNREACHABLE',
+              message: 'target refused connection',
+              retryable: true,
+            },
+          },
+        };
       }
       if (scenario === 'remove-mismatch') {
         return {
@@ -64,21 +74,25 @@ describe('mcp-smoke-client.mjs cleanup-safe control flow', () => {
   const originalArgv = process.argv;
   const originalEnv = { ...process.env };
   let exitSpy;
+  let errorSpy;
 
   beforeAll(() => {
     process.env.MCP_URL = 'http://localhost:9999';
     process.env.MCP_TOKEN = 'test-token';
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
   afterAll(() => {
     process.argv = originalArgv;
     process.env = originalEnv;
     exitSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   beforeEach(() => {
     exitSpy.mockClear();
+    errorSpy.mockClear();
   });
 
   it('closes the MCP client before exiting when publish validation fails', async () => {
@@ -111,6 +125,9 @@ describe('mcp-smoke-client.mjs cleanup-safe control flow', () => {
     expect(closeCallCount).toBe(1);
     expect(exitSpy).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy).toHaveBeenCalledOnce();
+    expect(errorSpy.mock.calls[0]?.[0]).toContain('PORT_UNREACHABLE');
+    expect(errorSpy.mock.calls[0]?.[0]).toContain('target refused connection');
   });
 
   it('closes the MCP client and exits 0 on a matching publish response', async () => {
