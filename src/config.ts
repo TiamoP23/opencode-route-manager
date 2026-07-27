@@ -1,4 +1,10 @@
 import type { CloudflareConfig } from './domain.js';
+import {
+  MANAGED_MIDDLEWARE_NAME,
+  loadManagedBasicAuth,
+  type ManagedBasicAuth,
+  type PasswordHasher,
+} from './basic-auth.js';
 
 export interface AppConfig {
   listenHost: string;
@@ -7,6 +13,7 @@ export interface AppConfig {
   upstreamHost: string;
   publicDomain: string;
   middleware: string;
+  managedBasicAuth: ManagedBasicAuth | null;
   minPort: number;
   maxPort: number;
   deniedPorts: ReadonlySet<number>;
@@ -17,6 +24,10 @@ export interface AppConfig {
   mcpToken: string;
   traefikProviderToken: string;
   cloudflare: CloudflareConfig | null;
+}
+
+interface ConfigDependencies {
+  hashPassword?: PasswordHasher;
 }
 
 function parseBoundedInt(
@@ -72,7 +83,10 @@ function validatePortSet(members: string[]): number[] {
 /** Allowed token characters: alphanumeric, underscore, hyphen. */
 const TOKEN_RE = /^[a-zA-Z0-9_-]+$/;
 
-export function loadConfig(env: Record<string, string | undefined>): AppConfig {
+export function loadConfig(
+  env: Record<string, string | undefined>,
+  dependencies: ConfigDependencies = {},
+): AppConfig {
   const mcpToken = env['MCP_TOKEN'] ?? '';
   const traefikProviderToken = env['TRAEFIK_PROVIDER_TOKEN'] ?? '';
 
@@ -120,13 +134,26 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     throw new Error(`MIN_PORT=${minPort} must not exceed MAX_PORT=${maxPort}`);
   }
 
+  const managedBasicAuth = loadManagedBasicAuth(
+    env,
+    dependencies.hashPassword,
+  );
+  const explicitMiddleware = env['TRAEFIK_MIDDLEWARE'];
+  if (managedBasicAuth && explicitMiddleware !== undefined) {
+    throw new Error('BASIC_AUTH_PASSWORD cannot be combined with TRAEFIK_MIDDLEWARE');
+  }
+  const middleware = managedBasicAuth
+    ? MANAGED_MIDDLEWARE_NAME
+    : explicitMiddleware || 'dev-basic-auth@file';
+
   return {
     listenHost: env['LISTEN_HOST'] ?? '0.0.0.0',
     listenPort: parseBoundedInt(env, 'LISTEN_PORT', 3000, 1, 65535),
     databasePath: env['DATABASE_PATH'] ?? '/data/routes.sqlite',
     upstreamHost: env['UPSTREAM_HOST'] ?? 'opencode',
     publicDomain: env['PUBLIC_DOMAIN'] ?? 'tiamop23.de',
-    middleware: env['TRAEFIK_MIDDLEWARE'] ?? 'dev-basic-auth@file',
+    middleware,
+    managedBasicAuth,
     minPort,
     maxPort,
     deniedPorts: new Set(validatePortSet(parseLowercaseSet(env, 'DENIED_PORTS', '4096'))),

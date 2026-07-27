@@ -11,6 +11,7 @@ const config: AppConfig = {
   upstreamHost: 'opencode',
   publicDomain: 'tiamop23.de',
   middleware: 'dev-basic-auth@file',
+  managedBasicAuth: null,
   minPort: 1024,
   maxPort: 65535,
   deniedPorts: new Set([4096]),
