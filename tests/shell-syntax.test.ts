@@ -51,7 +51,9 @@ describe('container-smoke.sh', () => {
     expect(smokeContent).not.toContain('traefik-dynamic.yml');
   });
 
-  it('checks removal through the same route hostname', () => {
-    expect(smokeContent).toContain('"removed route-smoke" 20 "Host: route-smoke.tiamop23.de"');
+  it('asserts route-manager runs as non-root UID 1000', () => {
+    expect(smokeContent).toContain('id -u');
+    expect(smokeContent).toContain('[ "$EUID" != "1000" ]');
+    expect(smokeContent).toContain('route-manager expected effective UID 1000');
   });
 });

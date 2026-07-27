@@ -23,6 +23,7 @@ if (action !== 'publish' && action !== 'remove') {
 if (!slug) fail('slug argument is required');
 
 let toolArgs;
+let expectedPort;
 if (action === 'publish') {
   if (!portText) fail('port argument is required for publish');
   const port = Number(portText);
@@ -30,6 +31,7 @@ if (action === 'publish') {
     fail(`port must be an integer between 1 and 65535, got "${portText}"`);
   }
   toolArgs = { slug, port };
+  expectedPort = port;
 } else {
   toolArgs = { slug };
 }
@@ -48,7 +50,39 @@ try {
     name: action === 'publish' ? 'publish_service' : 'remove_service',
     arguments: toolArgs,
   });
-  if (result.isError) toolFailed = true;
+  if (result.isError) {
+    toolFailed = true;
+  } else if (action === 'publish') {
+    if (!result.structuredContent) {
+      fail('publish_service response missing structuredContent');
+    }
+    const { service, url } = result.structuredContent;
+    if (service?.slug !== slug) {
+      fail(`expected published slug "${slug}", got "${service?.slug}"`);
+    }
+    if (service?.port !== expectedPort) {
+      fail(`expected published port ${expectedPort}, got ${service?.port}`);
+    }
+    if (service?.status !== 'active') {
+      fail(`expected published status active, got "${service?.status}"`);
+    }
+    if (!url || !url.includes(slug)) {
+      fail(`expected public URL containing "${slug}", got "${url}"`);
+    }
+    console.log(JSON.stringify(result.structuredContent));
+  } else {
+    if (!result.structuredContent) {
+      fail('remove_service response missing structuredContent');
+    }
+    const { slug: removedSlug, removed } = result.structuredContent;
+    if (removedSlug !== slug) {
+      fail(`expected removed slug "${slug}", got "${removedSlug}"`);
+    }
+    if (removed !== true) {
+      fail(`expected removed:true, got ${removed}`);
+    }
+    console.log(JSON.stringify(result.structuredContent));
+  }
 } finally {
   await client.close().catch(() => {});
 }
