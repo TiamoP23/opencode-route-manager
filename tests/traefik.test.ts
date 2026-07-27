@@ -52,6 +52,15 @@ describe('buildTraefikDocument', () => {
             },
           },
         },
+        middlewares: {
+          'agent-provider-sentinel': {
+            headers: {
+              customRequestHeaders: {
+                'X-Route-Manager-Sentinel': '1',
+              },
+            },
+          },
+        },
       },
     });
   });
@@ -94,10 +103,56 @@ describe('buildTraefikDocument', () => {
     expect(() => buildTraefikDocument(routes, config)).toThrow(RouteManagerError);
   });
 
-  it('returns empty projection for empty routes', () => {
+  it('keeps an external-mode zero-route document non-empty with an unused sentinel', () => {
     expect(buildTraefikDocument([], config)).toEqual({
-      http: { routers: {}, services: {} },
+      http: {
+        routers: {},
+        services: {},
+        middlewares: {
+          'agent-provider-sentinel': {
+            headers: {
+              customRequestHeaders: {
+                'X-Route-Manager-Sentinel': '1',
+              },
+            },
+          },
+        },
+      },
     });
+  });
+
+  it('publishes managed BasicAuth even with zero routes', () => {
+    const managed = {
+      ...config,
+      middleware: 'agent-basic-auth',
+      managedBasicAuth: {
+        username: 'opencode',
+        userEntry: 'opencode:$2b$12$hash',
+      },
+    };
+    expect(buildTraefikDocument([], managed).http.middlewares).toEqual({
+      'agent-basic-auth': {
+        basicAuth: {
+          users: ['opencode:$2b$12$hash'],
+          removeHeader: true,
+        },
+      },
+    });
+  });
+
+  it('references the provider-managed middleware without a provider suffix', () => {
+    const managed = {
+      ...config,
+      middleware: 'agent-basic-auth',
+      managedBasicAuth: {
+        username: 'opencode',
+        userEntry: 'opencode:$2b$12$hash',
+      },
+    };
+    const doc = buildTraefikDocument([activeRoute('demo', 5173)], managed);
+    expect(doc.http.routers['agent-demo']!.middlewares)
+      .toEqual(['agent-basic-auth']);
+    expect(JSON.stringify(doc)).not.toContain('secret');
   });
 
   it('includes multiple active routes', () => {

@@ -2,6 +2,19 @@ import type { AppConfig } from './config.js';
 import type { RouteRecord } from './domain.js';
 import { RouteManagerError } from './errors.js';
 
+type TraefikMiddleware =
+  | {
+      basicAuth: {
+        users: string[];
+        removeHeader: boolean;
+      };
+    }
+  | {
+      headers: {
+        customRequestHeaders: Record<string, string>;
+      };
+    };
+
 export interface TraefikDocument {
   http: {
     routers: Record<string, {
@@ -15,6 +28,7 @@ export interface TraefikDocument {
         servers: Array<{ url: string }>;
       };
     }>;
+    middlewares: Record<string, TraefikMiddleware>;
   };
 }
 
@@ -24,6 +38,25 @@ export function buildTraefikDocument(
 ): TraefikDocument {
   const routers: TraefikDocument['http']['routers'] = {};
   const services: TraefikDocument['http']['services'] = {};
+  const middlewares: TraefikDocument['http']['middlewares'] =
+    config.managedBasicAuth
+      ? {
+          'agent-basic-auth': {
+            basicAuth: {
+              users: [config.managedBasicAuth.userEntry],
+              removeHeader: true,
+            },
+          },
+        }
+      : {
+          'agent-provider-sentinel': {
+            headers: {
+              customRequestHeaders: {
+                'X-Route-Manager-Sentinel': '1',
+              },
+            },
+          },
+        };
 
   const sorted = [...routes].sort((a, b) => a.slug.localeCompare(b.slug));
 
@@ -51,5 +84,5 @@ export function buildTraefikDocument(
     };
   }
 
-  return { http: { routers, services } };
+  return { http: { routers, services, middlewares } };
 }
