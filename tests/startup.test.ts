@@ -857,35 +857,43 @@ describe('ESM main guard', () => {
     expect(typeof mod.startApplication).toBe('function');
   });
 
-  it('fails fast with invalid BASIC_AUTH_PASSWORD without leaking it', () => {
-    const tsx = join(process.cwd(), 'node_modules', '.bin', 'tsx');
-    const leakedPassword = 'leaked-startup-password';
+  it('sanitizes startup failure when password hashing fails', async () => {
+    const { runApplication } = await import('../src/index.js');
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: string[]) => { logs.push(args.join(' ')); };
+
+    const leakedPassword = 'secret-hash-failure-password';
+    let hasherRan = false;
+    const exitCodes: number[] = [];
+
     try {
-      execFileSync(
-        tsx,
-        [join(process.cwd(), 'src/index.ts')],
+      await runApplication(
         {
-          cwd: process.cwd(),
           env: {
-            ...process.env,
             MCP_TOKEN: 'a'.repeat(32),
             TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
             BASIC_AUTH_PASSWORD: leakedPassword,
-            BASIC_AUTH_USERNAME: 'bad:user',
           },
-          encoding: 'utf8',
-          timeout: 5000,
+        },
+        {
+          exit: (code: number) => { exitCodes.push(code); },
+          hashPassword: (password: string) => {
+            hasherRan = true;
+            throw new Error(`hash failed: ${password}`);
+          },
         },
       );
-      expect('unreachable').toBe('reached');
-    } catch (err: unknown) {
-      const result = err as { status: number; stdout: string; stderr: string };
-      expect(result.status).toBe(1);
-      expect(result.stdout).toContain('config_loading');
-      expect(result.stdout).toContain('startup_failed');
-      const combined = `${result.stdout}\n${result.stderr}`;
-      expect(combined).not.toContain(leakedPassword);
+    } finally {
+      console.log = origLog;
     }
+
+    expect(hasherRan).toBe(true);
+    expect(exitCodes).toEqual([1]);
+    const logOutput = logs.join('\n');
+    expect(logOutput).toContain('config_loading');
+    expect(logOutput).toContain('startup_failed');
+    expect(logOutput).not.toContain(leakedPassword);
   });
 
   it('fails fast with invalid config via execFileSync', () => {

@@ -11,6 +11,7 @@ import { createHttpApp } from './http.js';
 import { probeTcpPort } from './port-probe.js';
 import { CloudflareDnsManager } from './cloudflare.js';
 import type { DnsManager, PortProbe } from './domain.js';
+import type { PasswordHasher } from './basic-auth.js';
 
 const MIGRATIONS_FOLDER = new URL('../drizzle', import.meta.url).pathname;
 
@@ -118,7 +119,10 @@ const INITIAL_RECONCILE_DEADLINE_MS = 10_000;
 
 export async function startApplication(
   options: StartOptions,
-  overrides?: { runtime?: Partial<RuntimeDeps> },
+  overrides?: {
+    runtime?: Partial<RuntimeDeps> | undefined;
+    hashPassword?: PasswordHasher | undefined;
+  },
 ): Promise<RunningApplication> {
   const runtime: RuntimeDeps = { ...defaultRuntime, ...overrides?.runtime };
   const { env } = options;
@@ -140,7 +144,9 @@ export async function startApplication(
     // Stage 1 — Config
     // -----------------------------------------------------------------------
     log('config_loading');
-    const config: AppConfig = loadConfig(env);
+    const config: AppConfig = loadConfig(env, {
+      hashPassword: overrides?.hashPassword,
+    });
     log('config_loaded');
 
     // -----------------------------------------------------------------------
@@ -363,6 +369,30 @@ export async function startApplication(
 }
 
 // ---------------------------------------------------------------------------
+// Main runner — used by the ESM main-module guard and tests.
+// ---------------------------------------------------------------------------
+
+export async function runApplication(
+  options: StartOptions,
+  overrides?: {
+    runtime?: Partial<RuntimeDeps> | undefined;
+    hashPassword?: PasswordHasher | undefined;
+    exit?: ((code: number) => void) | undefined;
+  },
+): Promise<void> {
+  const exit = overrides?.exit ?? process.exit;
+  try {
+    await startApplication(options, {
+      runtime: overrides?.runtime,
+      hashPassword: overrides?.hashPassword,
+    });
+  } catch {
+    log('startup_failed');
+    exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ESM main-module guard
 // ---------------------------------------------------------------------------
 
@@ -371,8 +401,5 @@ const isMainModule =
   fileURLToPath(import.meta.url) === process.argv[1];
 
 if (isMainModule) {
-  startApplication({ env: process.env }).catch(() => {
-    log('startup_failed');
-    process.exit(1);
-  });
+  runApplication({ env: process.env });
 }

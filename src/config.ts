@@ -27,7 +27,7 @@ export interface AppConfig {
 }
 
 interface ConfigDependencies {
-  hashPassword?: PasswordHasher;
+  hashPassword?: PasswordHasher | undefined;
 }
 
 function parseBoundedInt(
