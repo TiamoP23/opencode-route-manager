@@ -44,4 +44,14 @@ describe('container-smoke.sh', () => {
       expect(smokeContent).toContain(removalHost);
     });
   });
+
+  it('uses route-manager-managed BasicAuth', () => {
+    expect(smokeContent).toContain('-e BASIC_AUTH_PASSWORD=test \\');
+    expect(smokeContent).not.toContain('dev-basic-auth-users');
+    expect(smokeContent).not.toContain('traefik-dynamic.yml');
+  });
+
+  it('checks removal through the same route hostname', () => {
+    expect(smokeContent).toContain('"removed route-smoke" 20 "Host: route-smoke.tiamop23.de"');
+  });
 });

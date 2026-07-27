@@ -9,7 +9,7 @@ RUN_ID="smoke-$(date +%s)-$$"
 #
 # Smoke test: build and run the route-manager sidecar alongside a
 # node:24-alpine HTTP/WebSocket target and traefik:v3.1 with
-# file-provided BasicAuth, exercising the full MCP publish→route→remove
+# route-manager-managed BasicAuth, exercising the full MCP publish→route→remove
 # lifecycle.
 #
 # Prerequisites: podman (preferred) or docker on the host.
@@ -127,11 +127,10 @@ poll_body() {
 }
 
 # ---------------------------------------------------------------------------
-# Generate secrets & BasicAuth hash (bundled Node, no OpenSSL dependency)
+# Generate secrets (bundled Node, no OpenSSL dependency)
 # ---------------------------------------------------------------------------
 PROVIDER_TOKEN=$(node -e "const{randomBytes}=require('crypto');process.stdout.write(randomBytes(32).toString('hex'))")
 MCP_TOKEN=$(node -e "const{randomBytes}=require('crypto');process.stdout.write(randomBytes(32).toString('hex'))")
-BASIC_AUTH_HASH=$(node -e "const{createHash}=require('crypto');const b=createHash('sha1').update('test').digest();process.stdout.write('{SHA}'+b.toString('base64'))")
 
 # ---------------------------------------------------------------------------
 # Generate Traefik static & dynamic YAML under TEST_DIR
@@ -145,22 +144,10 @@ providers:
     pollInterval: 2s
     headers:
       Authorization: "Bearer ${PROVIDER_TOKEN}"
-  file:
-    filename: /etc/traefik/dynamic.yml
-    watch: false
 entryPoints:
   web:
     address: ":80"
 TRAEFIK_STATIC
-
-cat > "$TEST_DIR/traefik-dynamic.yml" <<TRAEFIK_DYNAMIC
-http:
-  middlewares:
-    dev-basic-auth:
-      basicAuth:
-        users:
-          - "opencode:${BASIC_AUTH_HASH}"
-TRAEFIK_DYNAMIC
 
 # ---------------------------------------------------------------------------
 # Build
@@ -224,10 +211,11 @@ $RUNTIME run -d --name "${RUN_ID}-route-manager" \
   -v "${RUN_ID}-data:/data" \
   -e MCP_TOKEN="${MCP_TOKEN}" \
   -e TRAEFIK_PROVIDER_TOKEN="${PROVIDER_TOKEN}" \
+  -e BASIC_AUTH_PASSWORD=test \
   opencode-route-manager:test
 
 # ---------------------------------------------------------------------------
-# Start traefik with file-provided BasicAuth
+# Start traefik with route-manager HTTP provider
 # ---------------------------------------------------------------------------
 echo "=== start ${RUN_ID}-traefik ===" >&2
 $RUNTIME run -d --name "${RUN_ID}-traefik" \
@@ -235,7 +223,6 @@ $RUNTIME run -d --name "${RUN_ID}-traefik" \
   --restart no \
   -p "127.0.0.1::80" \
   -v "$TEST_DIR/traefik-static.yml:/etc/traefik/traefik.yml:ro" \
-  -v "$TEST_DIR/traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro" \
   traefik:v3.1
 
 # ---------------------------------------------------------------------------
