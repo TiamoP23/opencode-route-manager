@@ -3,6 +3,7 @@ import type { AppConfig } from '../src/config.js';
 import type { RouteRecord } from '../src/domain.js';
 import { buildTraefikDocument } from '../src/traefik.js';
 import { RouteManagerError } from '../src/errors.js';
+import { MANAGED_MIDDLEWARE_NAME } from '../src/basic-auth.js';
 
 const config: AppConfig = {
   listenHost: '0.0.0.0',
@@ -124,14 +125,14 @@ describe('buildTraefikDocument', () => {
   it('publishes managed BasicAuth even with zero routes', () => {
     const managed = {
       ...config,
-      middleware: 'agent-basic-auth',
+      middleware: MANAGED_MIDDLEWARE_NAME,
       managedBasicAuth: {
         username: 'opencode',
         userEntry: 'opencode:$2b$12$hash',
       },
     };
     expect(buildTraefikDocument([], managed).http.middlewares).toEqual({
-      'agent-basic-auth': {
+      [MANAGED_MIDDLEWARE_NAME]: {
         basicAuth: {
           users: ['opencode:$2b$12$hash'],
           removeHeader: true,
@@ -143,7 +144,7 @@ describe('buildTraefikDocument', () => {
   it('references the provider-managed middleware without a provider suffix', () => {
     const managed = {
       ...config,
-      middleware: 'agent-basic-auth',
+      middleware: MANAGED_MIDDLEWARE_NAME,
       managedBasicAuth: {
         username: 'opencode',
         userEntry: 'opencode:$2b$12$hash',
@@ -151,8 +152,21 @@ describe('buildTraefikDocument', () => {
     };
     const doc = buildTraefikDocument([activeRoute('demo', 5173)], managed);
     expect(doc.http.routers['agent-demo']!.middlewares)
-      .toEqual(['agent-basic-auth']);
+      .toEqual([MANAGED_MIDDLEWARE_NAME]);
     expect(JSON.stringify(doc)).not.toContain('secret');
+  });
+
+  it('uses the shared MANAGED_MIDDLEWARE_NAME constant for the middleware key', () => {
+    const managed = {
+      ...config,
+      middleware: MANAGED_MIDDLEWARE_NAME,
+      managedBasicAuth: {
+        username: 'opencode',
+        userEntry: 'opencode:$2b$12$hash',
+      },
+    };
+    const doc = buildTraefikDocument([], managed);
+    expect(Object.keys(doc.http.middlewares)).toEqual([MANAGED_MIDDLEWARE_NAME]);
   });
 
   it('includes multiple active routes', () => {

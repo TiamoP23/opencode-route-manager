@@ -857,6 +857,37 @@ describe('ESM main guard', () => {
     expect(typeof mod.startApplication).toBe('function');
   });
 
+  it('fails fast with invalid BASIC_AUTH_PASSWORD without leaking it', () => {
+    const tsx = join(process.cwd(), 'node_modules', '.bin', 'tsx');
+    const leakedPassword = 'leaked-startup-password';
+    try {
+      execFileSync(
+        tsx,
+        [join(process.cwd(), 'src/index.ts')],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            MCP_TOKEN: 'a'.repeat(32),
+            TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
+            BASIC_AUTH_PASSWORD: leakedPassword,
+            BASIC_AUTH_USERNAME: 'bad:user',
+          },
+          encoding: 'utf8',
+          timeout: 5000,
+        },
+      );
+      expect('unreachable').toBe('reached');
+    } catch (err: unknown) {
+      const result = err as { status: number; stdout: string; stderr: string };
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain('config_loading');
+      expect(result.stdout).toContain('startup_failed');
+      const combined = `${result.stdout}\n${result.stderr}`;
+      expect(combined).not.toContain(leakedPassword);
+    }
+  });
+
   it('fails fast with invalid config via execFileSync', () => {
     const tsx = join(process.cwd(), 'node_modules', '.bin', 'tsx');
     try {

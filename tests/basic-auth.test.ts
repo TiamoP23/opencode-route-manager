@@ -57,4 +57,22 @@ describe('loadManagedBasicAuth', () => {
     expect(compareSync('secret', hash)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('secret');
   });
+
+  it('does not leak plaintext password when hashing fails', () => {
+    const password = 'secret-that-must-not-escape';
+    const hashPassword = vi.fn<PasswordHasher>(() => {
+      throw new Error('hashing failed');
+    });
+    let caught: Error | null = null;
+    try {
+      loadManagedBasicAuth({ BASIC_AUTH_PASSWORD: password }, hashPassword);
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeTruthy();
+    const inspect = `${caught!.message}\n${caught!.stack ?? ''}`;
+    expect(inspect).not.toContain(password);
+    // The function must not return any object when hashing fails.
+    expect(hashPassword).toHaveBeenCalledWith(password, BCRYPT_COST);
+  });
 });

@@ -1,6 +1,7 @@
 import type { AppConfig } from './config.js';
 import type { RouteRecord } from './domain.js';
 import { RouteManagerError } from './errors.js';
+import { MANAGED_MIDDLEWARE_NAME } from './basic-auth.js';
 
 type TraefikMiddleware =
   | {
@@ -41,7 +42,7 @@ export function buildTraefikDocument(
   const middlewares: TraefikDocument['http']['middlewares'] =
     config.managedBasicAuth
       ? {
-          'agent-basic-auth': {
+          [MANAGED_MIDDLEWARE_NAME]: {
             basicAuth: {
               users: [config.managedBasicAuth.userEntry],
               removeHeader: true,

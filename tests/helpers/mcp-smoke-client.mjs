@@ -44,6 +44,8 @@ const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
 const client = new Client({ name: 'route-manager-smoke', version: '1.0.0' });
 
 let toolFailed = false;
+let validationError = null;
+let resultToLog = null;
 try {
   await client.connect(transport);
   const result = await client.callTool({
@@ -54,36 +56,44 @@ try {
     toolFailed = true;
   } else if (action === 'publish') {
     if (!result.structuredContent) {
-      fail('publish_service response missing structuredContent');
+      validationError = 'publish_service response missing structuredContent';
+    } else {
+      const { service, url } = result.structuredContent;
+      if (service?.slug !== slug) {
+        validationError = `expected published slug "${slug}", got "${service?.slug}"`;
+      } else if (service?.port !== expectedPort) {
+        validationError = `expected published port ${expectedPort}, got ${service?.port}`;
+      } else if (service?.status !== 'active') {
+        validationError = `expected published status active, got "${service?.status}"`;
+      } else if (!url || !url.includes(slug)) {
+        validationError = `expected public URL containing "${slug}", got "${url}"`;
+      } else {
+        resultToLog = result.structuredContent;
+      }
     }
-    const { service, url } = result.structuredContent;
-    if (service?.slug !== slug) {
-      fail(`expected published slug "${slug}", got "${service?.slug}"`);
-    }
-    if (service?.port !== expectedPort) {
-      fail(`expected published port ${expectedPort}, got ${service?.port}`);
-    }
-    if (service?.status !== 'active') {
-      fail(`expected published status active, got "${service?.status}"`);
-    }
-    if (!url || !url.includes(slug)) {
-      fail(`expected public URL containing "${slug}", got "${url}"`);
-    }
-    console.log(JSON.stringify(result.structuredContent));
   } else {
     if (!result.structuredContent) {
-      fail('remove_service response missing structuredContent');
+      validationError = 'remove_service response missing structuredContent';
+    } else {
+      const { slug: removedSlug, removed } = result.structuredContent;
+      if (removedSlug !== slug) {
+        validationError = `expected removed slug "${slug}", got "${removedSlug}"`;
+      } else if (removed !== true) {
+        validationError = `expected removed:true, got ${removed}`;
+      } else {
+        resultToLog = result.structuredContent;
+      }
     }
-    const { slug: removedSlug, removed } = result.structuredContent;
-    if (removedSlug !== slug) {
-      fail(`expected removed slug "${slug}", got "${removedSlug}"`);
-    }
-    if (removed !== true) {
-      fail(`expected removed:true, got ${removed}`);
-    }
-    console.log(JSON.stringify(result.structuredContent));
   }
 } finally {
   await client.close().catch(() => {});
 }
-if (toolFailed) process.exit(1);
+if (resultToLog) {
+  console.log(JSON.stringify(resultToLog));
+}
+if (toolFailed) {
+  process.exit(1);
+}
+if (validationError) {
+  fail(validationError);
+}
