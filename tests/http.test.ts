@@ -87,6 +87,7 @@ function testConfig(): AppConfig {
     upstreamHost: 'upstream',
     publicDomain: 'test.dev',
     middleware: 'test@file',
+    managedBasicAuth: null,
     minPort: 1024,
     maxPort: 65535,
     deniedPorts: new Set<number>(),

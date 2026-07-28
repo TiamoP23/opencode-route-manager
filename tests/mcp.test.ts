@@ -176,6 +176,7 @@ function testConfig(): AppConfig {
     upstreamHost: 'upstream',
     publicDomain: 'test.dev',
     middleware: 'test@file',
+    managedBasicAuth: null,
     minPort: 1024,
     maxPort: 65535,
     deniedPorts: new Set<number>(),
@@ -518,6 +519,22 @@ describe('MCP tools', () => {
     expect(callResult.structuredContent).toEqual(body);
   });
 
+  it('publish_service structuredContent reflects requested slug, port, and active status', async () => {
+    const callResult = await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'smoke-app', port: 5173 },
+    }) as CallResult;
+
+    expect(callResult.isError).toBeUndefined();
+    const content = callResult.structuredContent as Record<string, unknown>;
+    expect(content).toBeDefined();
+    const service = content.service as Record<string, unknown>;
+    expect(service.slug).toBe('smoke-app');
+    expect(service.port).toBe(5173);
+    expect(service.status).toBe('active');
+    expect(content.url).toBe('https://smoke-app.test.dev');
+  });
+
   it('publish_service accepts nullable description', async () => {
     const callResult = await client.callTool({
       name: 'publish_service',
@@ -604,6 +621,22 @@ describe('MCP tools', () => {
     const body = JSON.parse(callResult.content[0]!.text);
     expect(body).toEqual({ slug: 'my-app', removed: true });
     expect(callResult.structuredContent).toEqual(body);
+  });
+
+  it('remove_service structuredContent contains requested slug and removed:true', async () => {
+    await client.callTool({
+      name: 'publish_service',
+      arguments: { slug: 'smoke-app', port: 5173 },
+    });
+
+    const callResult = await client.callTool({
+      name: 'remove_service',
+      arguments: { slug: 'smoke-app' },
+    }) as CallResult;
+
+    expect(callResult.isError).toBeUndefined();
+    const content = callResult.structuredContent as Record<string, unknown>;
+    expect(content).toEqual({ slug: 'smoke-app', removed: true });
   });
 
   it('remove_service returns removed=false for non-existent route', async () => {

@@ -23,6 +23,7 @@ if (action !== 'publish' && action !== 'remove') {
 if (!slug) fail('slug argument is required');
 
 let toolArgs;
+let expectedPort;
 if (action === 'publish') {
   if (!portText) fail('port argument is required for publish');
   const port = Number(portText);
@@ -30,6 +31,7 @@ if (action === 'publish') {
     fail(`port must be an integer between 1 and 65535, got "${portText}"`);
   }
   toolArgs = { slug, port };
+  expectedPort = port;
 } else {
   toolArgs = { slug };
 }
@@ -42,14 +44,62 @@ const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
 const client = new Client({ name: 'route-manager-smoke', version: '1.0.0' });
 
 let toolFailed = false;
+let toolFailureDetail = null;
+let validationError = null;
+let resultToLog = null;
 try {
   await client.connect(transport);
   const result = await client.callTool({
     name: action === 'publish' ? 'publish_service' : 'remove_service',
     arguments: toolArgs,
   });
-  if (result.isError) toolFailed = true;
+  if (result.isError) {
+    toolFailed = true;
+    const structuredError = result.structuredContent?.error;
+    const contentText = result.content?.find((item) => item.type === 'text')?.text;
+    toolFailureDetail = structuredError
+      ? JSON.stringify(structuredError)
+      : contentText ?? 'unknown error';
+  } else if (action === 'publish') {
+    if (!result.structuredContent) {
+      validationError = 'publish_service response missing structuredContent';
+    } else {
+      const { service, url } = result.structuredContent;
+      if (service?.slug !== slug) {
+        validationError = `expected published slug "${slug}", got "${service?.slug}"`;
+      } else if (service?.port !== expectedPort) {
+        validationError = `expected published port ${expectedPort}, got ${service?.port}`;
+      } else if (service?.status !== 'active') {
+        validationError = `expected published status active, got "${service?.status}"`;
+      } else if (!url || !url.includes(slug)) {
+        validationError = `expected public URL containing "${slug}", got "${url}"`;
+      } else {
+        resultToLog = result.structuredContent;
+      }
+    }
+  } else {
+    if (!result.structuredContent) {
+      validationError = 'remove_service response missing structuredContent';
+    } else {
+      const { slug: removedSlug, removed } = result.structuredContent;
+      if (removedSlug !== slug) {
+        validationError = `expected removed slug "${slug}", got "${removedSlug}"`;
+      } else if (removed !== true) {
+        validationError = `expected removed:true, got ${removed}`;
+      } else {
+        resultToLog = result.structuredContent;
+      }
+    }
+  }
 } finally {
   await client.close().catch(() => {});
 }
-if (toolFailed) process.exit(1);
+if (resultToLog) {
+  console.log(JSON.stringify(resultToLog));
+}
+if (toolFailed) {
+  fail(`tool call failed: ${toolFailureDetail}`);
+}
+if (validationError) {
+  fail(validationError);
+}

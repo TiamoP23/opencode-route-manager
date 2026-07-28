@@ -857,6 +857,45 @@ describe('ESM main guard', () => {
     expect(typeof mod.startApplication).toBe('function');
   });
 
+  it('sanitizes startup failure when password hashing fails', async () => {
+    const { runApplication } = await import('../src/index.js');
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: string[]) => { logs.push(args.join(' ')); };
+
+    const leakedPassword = 'secret-hash-failure-password';
+    let hasherRan = false;
+    const exitCodes: number[] = [];
+
+    try {
+      await runApplication(
+        {
+          env: {
+            MCP_TOKEN: 'a'.repeat(32),
+            TRAEFIK_PROVIDER_TOKEN: 'b'.repeat(32),
+            BASIC_AUTH_PASSWORD: leakedPassword,
+          },
+        },
+        {
+          exit: (code: number) => { exitCodes.push(code); },
+          hashPassword: (password: string) => {
+            hasherRan = true;
+            throw new Error(`hash failed: ${password}`);
+          },
+        },
+      );
+    } finally {
+      console.log = origLog;
+    }
+
+    expect(hasherRan).toBe(true);
+    expect(exitCodes).toEqual([1]);
+    const logOutput = logs.join('\n');
+    expect(logOutput).toContain('config_loading');
+    expect(logOutput).toContain('startup_failed');
+    expect(logOutput).not.toContain(leakedPassword);
+  });
+
   it('fails fast with invalid config via execFileSync', () => {
     const tsx = join(process.cwd(), 'node_modules', '.bin', 'tsx');
     try {

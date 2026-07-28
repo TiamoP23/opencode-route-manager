@@ -14,7 +14,9 @@ configuration and optional Cloudflare DNS.
 | `LISTEN_PORT` | `3000` | No | HTTP listen port. |
 | `UPSTREAM_HOST` | `opencode` | No | Container hostname used for port-probe connectivity checks. Published apps must be reachable at `UPSTREAM_HOST:{port}`. |
 | `PUBLIC_DOMAIN` | `tiamop23.de` | No | Public domain for generated routes (e.g. `{slug}.tiamop23.de`). |
-| `TRAEFIK_MIDDLEWARE` | `dev-basic-auth@file` | No | Traefik middleware reference applied to every route. |
+| `BASIC_AUTH_PASSWORD` | - | No | Enables route-manager-managed BasicAuth. Pass the same password used by OpenCode/code-server. Must be non-empty and at most 72 UTF-8 bytes. Mutually exclusive with `TRAEFIK_MIDDLEWARE`. |
+| `BASIC_AUTH_USERNAME` | `opencode` | No | Username for managed BasicAuth; 1-64 ASCII letters, digits, `.`, `_`, or `-`. Requires `BASIC_AUTH_PASSWORD`; setting it without `BASIC_AUTH_PASSWORD` is an error. |
+| `TRAEFIK_MIDDLEWARE` | `dev-basic-auth@file` | No | External middleware reference used only when `BASIC_AUTH_PASSWORD` is absent. |
 | `MIN_PORT` | `1024` | No | Minimum allowed target port. |
 | `MAX_PORT` | `65535` | No | Maximum allowed target port. |
 | `DENIED_PORTS` | `4096` | No | Comma-separated list of ports that are never allowed. |
@@ -90,6 +92,32 @@ The manager exposes four tools over the MCP protocol (Streamable HTTP transport 
   `CLOUDFLARE_API_TOKEN` needs `Zone.DNS:Edit` permission for the target zone.
   Tokens are never logged or exposed in error messages.
 
+## Managed BasicAuth
+
+For a password-based deployment, pass the same secret to OpenCode and
+route-manager:
+
+```yaml
+- OPENCODE_SERVER_PASSWORD=${WORKSPACE_PASSWORD}
+- BASIC_AUTH_PASSWORD=${WORKSPACE_PASSWORD}
+```
+
+Route-manager hashes the password with bcrypt cost 12 at startup and publishes
+`agent-basic-auth@http`. The plaintext password remains only in the process
+environment; route-manager does not persist it in SQLite or provider state and
+does not write it to logs. The runtime provider document contains only the
+bcrypt hash. Remove `TRAEFIK_MIDDLEWARE` in managed mode. Existing Authentik or
+file-provider deployments can omit `BASIC_AUTH_PASSWORD` and continue using
+`TRAEFIK_MIDDLEWARE`.
+
+The managed middleware is configured with `removeHeader: true`, so the upstream
+container never receives the Authorization header. It remains in zero-route
+provider documents, allowing Traefik to remove the final router without a
+restart.
+
+To rotate the password, update the shared password and recreate OpenCode,
+code-server, and route-manager; Traefik updates on its next HTTP-provider poll.
+
 ## Local Development
 
 ```bash
@@ -135,8 +163,9 @@ MCP_URL=http://route-manager:3000/mcp MCP_TOKEN=<your-mcp-token> \
   node tests/helpers/mcp-smoke-client.mjs publish demo 5173
 ```
 
-Your app will be proxied through Traefik with the middleware configured by
-`TRAEFIK_MIDDLEWARE` (default: BasicAuth). The public URL uses
-`PUBLIC_DOMAIN` (e.g., `https://demo.tiamop23.de`). Note that the port
-5173 must be reachable at `UPSTREAM_HOST:5173` (the `opencode` container on
-the internal network).
+Your app will be proxied through Traefik. In managed BasicAuth mode the
+`agent-basic-auth@http` middleware is applied automatically; otherwise the
+middleware configured by `TRAEFIK_MIDDLEWARE` is used (default:
+`dev-basic-auth@file`). The public URL uses `PUBLIC_DOMAIN` (e.g.,
+`https://demo.tiamop23.de`). Note that port 5173 must be reachable at
+`UPSTREAM_HOST:5173` (the `opencode` container on the internal network).

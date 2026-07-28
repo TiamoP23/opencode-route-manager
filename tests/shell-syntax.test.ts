@@ -44,4 +44,18 @@ describe('container-smoke.sh', () => {
       expect(smokeContent).toContain(removalHost);
     });
   });
+
+  it('uses route-manager-managed BasicAuth', () => {
+    expect(smokeContent).toContain('-e BASIC_AUTH_PASSWORD=test \\');
+    expect(smokeContent).not.toContain('dev-basic-auth-users');
+    expect(smokeContent).not.toContain('traefik-dynamic.yml');
+  });
+
+  it('asserts route-manager runs as non-root UID 1000', () => {
+    expect(smokeContent).toContain('id -u');
+    expect(smokeContent).toContain('CONTAINER_UID=');
+    expect(smokeContent).toContain('[ "$CONTAINER_UID" != "1000" ]');
+    expect(smokeContent).not.toContain('[ "$EUID"');
+    expect(smokeContent).toContain('route-manager expected effective UID 1000');
+  });
 });

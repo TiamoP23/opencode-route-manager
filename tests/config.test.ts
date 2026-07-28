@@ -105,4 +105,50 @@ describe('loadConfig', () => {
       loadConfig({ ...required, TRAEFIK_PROVIDER_TOKEN: 'ab cd' + 'x'.repeat(28) }),
     ).toThrow(/TRAEFIK_PROVIDER_TOKEN/);
   });
+
+  it('selects managed BasicAuth and its provider-local middleware', () => {
+    const config = loadConfig(
+      { ...required, BASIC_AUTH_PASSWORD: 'secret' },
+      { hashPassword: () => '$2b$12$managed' },
+    );
+    expect(config.managedBasicAuth).toEqual({
+      username: 'opencode',
+      userEntry: 'opencode:$2b$12$managed',
+    });
+    expect(config.middleware).toBe('agent-basic-auth');
+  });
+
+  it('rejects managed and explicit external middleware together', () => {
+    expect(() => loadConfig(
+      {
+        ...required,
+        BASIC_AUTH_PASSWORD: 'secret',
+        TRAEFIK_MIDDLEWARE: 'test-auth@file',
+      },
+      { hashPassword: () => '$2b$12$managed' },
+    )).toThrow(/BASIC_AUTH_PASSWORD.*TRAEFIK_MIDDLEWARE/);
+  });
+
+  it('rejects even an empty explicit external middleware in managed mode', () => {
+    expect(() => loadConfig(
+      {
+        ...required,
+        BASIC_AUTH_PASSWORD: 'secret',
+        TRAEFIK_MIDDLEWARE: '',
+      },
+      { hashPassword: () => '$2b$12$managed' },
+    )).toThrow(/BASIC_AUTH_PASSWORD.*TRAEFIK_MIDDLEWARE/);
+  });
+
+  it('preserves external middleware compatibility', () => {
+    const config = loadConfig({ ...required, TRAEFIK_MIDDLEWARE: 'test-auth@file' });
+    expect(config.managedBasicAuth).toBeNull();
+    expect(config.middleware).toBe('test-auth@file');
+  });
+
+  it('preserves empty explicit external middleware for backward compatibility', () => {
+    const config = loadConfig({ ...required, TRAEFIK_MIDDLEWARE: '' });
+    expect(config.managedBasicAuth).toBeNull();
+    expect(config.middleware).toBe('');
+  });
 });

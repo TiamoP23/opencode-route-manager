@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import type { AppConfig } from '../src/config.js';
+import { loadConfig, type AppConfig } from '../src/config.js';
 import type { RouteRecord } from '../src/domain.js';
 import { buildTraefikDocument } from '../src/traefik.js';
 import { RouteManagerError } from '../src/errors.js';
+import { MANAGED_MIDDLEWARE_NAME } from '../src/basic-auth.js';
 
 const config: AppConfig = {
   listenHost: '0.0.0.0',
@@ -11,6 +12,7 @@ const config: AppConfig = {
   upstreamHost: 'opencode',
   publicDomain: 'tiamop23.de',
   middleware: 'dev-basic-auth@file',
+  managedBasicAuth: null,
   minPort: 1024,
   maxPort: 65535,
   deniedPorts: new Set([4096]),
@@ -48,6 +50,15 @@ describe('buildTraefikDocument', () => {
             loadBalancer: {
               passHostHeader: true,
               servers: [{ url: 'http://opencode:5173' }],
+            },
+          },
+        },
+        middlewares: {
+          'agent-provider-sentinel': {
+            headers: {
+              customRequestHeaders: {
+                'X-Route-Manager-Sentinel': '1',
+              },
             },
           },
         },
@@ -93,10 +104,76 @@ describe('buildTraefikDocument', () => {
     expect(() => buildTraefikDocument(routes, config)).toThrow(RouteManagerError);
   });
 
-  it('returns empty projection for empty routes', () => {
+  it('keeps an external-mode zero-route document non-empty with an unused sentinel', () => {
     expect(buildTraefikDocument([], config)).toEqual({
-      http: { routers: {}, services: {} },
+      http: {
+        routers: {},
+        services: {},
+        middlewares: {
+          'agent-provider-sentinel': {
+            headers: {
+              customRequestHeaders: {
+                'X-Route-Manager-Sentinel': '1',
+              },
+            },
+          },
+        },
+      },
     });
+  });
+
+  it('publishes managed BasicAuth even with zero routes', () => {
+    const managed = {
+      ...config,
+      middleware: MANAGED_MIDDLEWARE_NAME,
+      managedBasicAuth: {
+        username: 'opencode',
+        userEntry: 'opencode:$2b$12$hash',
+      },
+    };
+    expect(buildTraefikDocument([], managed).http.middlewares).toEqual({
+      [MANAGED_MIDDLEWARE_NAME]: {
+        basicAuth: {
+          users: ['opencode:$2b$12$hash'],
+          removeHeader: true,
+        },
+      },
+    });
+  });
+
+  it('references the provider-managed middleware without a provider suffix', () => {
+    const rawPassword = 'raw-password-not-in-provider-document';
+    const managed = loadConfig(
+      {
+        MCP_TOKEN: 'm'.repeat(32),
+        TRAEFIK_PROVIDER_TOKEN: 't'.repeat(32),
+        BASIC_AUTH_PASSWORD: rawPassword,
+      },
+      { hashPassword: () => '$2b$12$hash' },
+    );
+    const doc = buildTraefikDocument([activeRoute('demo', 5173)], managed);
+    expect(doc.http.routers['agent-demo']!.middlewares)
+      .toEqual([MANAGED_MIDDLEWARE_NAME]);
+    expect(doc.http.middlewares[MANAGED_MIDDLEWARE_NAME]).toEqual({
+      basicAuth: {
+        users: ['opencode:$2b$12$hash'],
+        removeHeader: true,
+      },
+    });
+    expect(JSON.stringify(doc)).not.toContain(rawPassword);
+  });
+
+  it('uses the shared MANAGED_MIDDLEWARE_NAME constant for the middleware key', () => {
+    const managed = {
+      ...config,
+      middleware: MANAGED_MIDDLEWARE_NAME,
+      managedBasicAuth: {
+        username: 'opencode',
+        userEntry: 'opencode:$2b$12$hash',
+      },
+    };
+    const doc = buildTraefikDocument([], managed);
+    expect(Object.keys(doc.http.middlewares)).toEqual([MANAGED_MIDDLEWARE_NAME]);
   });
 
   it('includes multiple active routes', () => {
