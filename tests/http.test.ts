@@ -211,10 +211,12 @@ describe('HTTP runtime', () => {
     expect(res.headers.get('content-type')).toMatch(/json/);
     expect(res.headers.get('cache-control')).toBe('no-store');
     const body = await res.json();
-    // Empty traefik document shape
+    // Empty route maps are omitted because Traefik's HTTP decoder rejects
+    // explicit standalone routers/services elements.
     expect(body).toHaveProperty('http');
-    expect(body.http).toHaveProperty('routers');
-    expect(body.http).toHaveProperty('services');
+    expect(body.http).not.toHaveProperty('routers');
+    expect(body.http).not.toHaveProperty('services');
+    expect(body.http.middlewares).toHaveProperty('agent-provider-sentinel');
   });
 
   // -----------------------------------------------------------------------

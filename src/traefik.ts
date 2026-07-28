@@ -18,12 +18,12 @@ type TraefikMiddleware =
 
 export interface TraefikDocument {
   http: {
-    routers: Record<string, {
+    routers?: Record<string, {
       rule: string;
       service: string;
       middlewares: string[];
     }>;
-    services: Record<string, {
+    services?: Record<string, {
       loadBalancer: {
         passHostHeader: boolean;
         servers: Array<{ url: string }>;
@@ -83,6 +83,10 @@ export function buildTraefikDocument(
         servers: [{ url: `http://${config.upstreamHost}:${route.port}` }],
       },
     };
+  }
+
+  if (sorted.length === 0) {
+    return { http: { middlewares } };
   }
 
   return { http: { routers, services, middlewares } };

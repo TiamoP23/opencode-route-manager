@@ -467,7 +467,7 @@ describe('RouteService', () => {
 
       // activeTraefikDocument must exclude creating rows
       const doc = await svc.activeTraefikDocument();
-      expect(doc.http.routers['agent-dns-fail']).toBeUndefined();
+      expect(doc.http.routers).toBeUndefined();
     });
 
     it('duplicate publish: ROUTE_ALREADY_EXISTS', async () => {
@@ -803,7 +803,7 @@ describe('RouteService', () => {
 
       // activeTraefikDocument must exclude deleting rows
       const doc = await svc.activeTraefikDocument();
-      expect(doc.http.routers['agent-del-fail']).toBeUndefined();
+      expect(doc.http.routers).toBeUndefined();
     });
 
     it('persists findOwnedRecord errors in performDnsCleanup', async () => {
@@ -871,7 +871,7 @@ describe('RouteService', () => {
       await svc.publish({ slug: 'for-doc', port: 3000 });
 
       const doc = await svc.activeTraefikDocument();
-      const router = doc.http.routers['agent-for-doc'];
+      const router = doc.http.routers!['agent-for-doc'];
       expect(router).toBeDefined();
       expect(router!.rule).toContain('for-doc.tiamop23.de');
 

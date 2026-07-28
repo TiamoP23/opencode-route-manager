@@ -72,7 +72,7 @@ describe('buildTraefikDocument', () => {
       activeRoute('alpha', 3000),
     ];
     const doc = buildTraefikDocument(routes, config);
-    const routerKeys = Object.keys(doc.http.routers);
+    const routerKeys = Object.keys(doc.http.routers!);
     expect(routerKeys).toEqual(['agent-alpha', 'agent-zeta']);
   });
 
@@ -107,8 +107,6 @@ describe('buildTraefikDocument', () => {
   it('keeps an external-mode zero-route document non-empty with an unused sentinel', () => {
     expect(buildTraefikDocument([], config)).toEqual({
       http: {
-        routers: {},
-        services: {},
         middlewares: {
           'agent-provider-sentinel': {
             headers: {
@@ -131,11 +129,15 @@ describe('buildTraefikDocument', () => {
         userEntry: 'opencode:$2b$12$hash',
       },
     };
-    expect(buildTraefikDocument([], managed).http.middlewares).toEqual({
-      [MANAGED_MIDDLEWARE_NAME]: {
-        basicAuth: {
-          users: ['opencode:$2b$12$hash'],
-          removeHeader: true,
+    expect(buildTraefikDocument([], managed)).toEqual({
+      http: {
+        middlewares: {
+          [MANAGED_MIDDLEWARE_NAME]: {
+            basicAuth: {
+              users: ['opencode:$2b$12$hash'],
+              removeHeader: true,
+            },
+          },
         },
       },
     });
@@ -152,7 +154,7 @@ describe('buildTraefikDocument', () => {
       { hashPassword: () => '$2b$12$hash' },
     );
     const doc = buildTraefikDocument([activeRoute('demo', 5173)], managed);
-    expect(doc.http.routers['agent-demo']!.middlewares)
+    expect(doc.http.routers!['agent-demo']!.middlewares)
       .toEqual([MANAGED_MIDDLEWARE_NAME]);
     expect(doc.http.middlewares[MANAGED_MIDDLEWARE_NAME]).toEqual({
       basicAuth: {
@@ -182,10 +184,10 @@ describe('buildTraefikDocument', () => {
       activeRoute('second', 3001),
     ];
     const doc = buildTraefikDocument(routes, config);
-    expect(Object.keys(doc.http.routers)).toHaveLength(2);
-    expect(doc.http.routers['agent-first']).toBeDefined();
-    expect(doc.http.routers['agent-second']).toBeDefined();
-    expect(doc.http.services['agent-first']).toBeDefined();
-    expect(doc.http.services['agent-second']).toBeDefined();
+    expect(Object.keys(doc.http.routers!)).toHaveLength(2);
+    expect(doc.http.routers!['agent-first']).toBeDefined();
+    expect(doc.http.routers!['agent-second']).toBeDefined();
+    expect(doc.http.services!['agent-first']).toBeDefined();
+    expect(doc.http.services!['agent-second']).toBeDefined();
   });
 });
